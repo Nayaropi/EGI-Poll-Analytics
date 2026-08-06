@@ -1309,8 +1309,10 @@ def _load_egi_names() -> tuple:
                 with open(_p, "r", encoding="utf-8") as _f:
                     _data = _json.load(_f)
                 if isinstance(_data, dict) and "lookup" in _data:
-                    return _data["lookup"], True
-                return _data, True
+                    _merged = {**_EGI_LOOKUP_FALLBACK, **_data["lookup"]}
+                    return _merged, True
+                _merged = {**_EGI_LOOKUP_FALLBACK, **_data}
+                return _merged, True
         except Exception:
             pass
     return _EGI_LOOKUP_FALLBACK, False
@@ -1319,9 +1321,23 @@ EGI_NAME_LOOKUP, _EGI_JSON_FOUND = _load_egi_names()
 
 
 def extract_learning_hub_id(filename: str) -> str:
-    """Extract the Learning Hub Item ID (e.g. SUP_EDE_00012366 or SUP_EDE_00012366_001) from a filename."""
+    """Extract the Learning Hub Item ID from a filename.
+    Tries progressively shorter suffix variants until a lookup hit is found,
+    so filenames like SUP_EDE_0090_1712_001.xlsx resolve to the correct 4-part key.
+    """
     m = re.search(r'([A-Z]{2,}_[A-Z]{2,}_\d+(?:_\d+)*)', filename, re.IGNORECASE)
-    return m.group(1).upper() if m else ""
+    if not m:
+        return ""
+    full = m.group(1).upper()
+    candidate = full
+    while True:
+        if candidate in EGI_NAME_LOOKUP:
+            return candidate
+        shorter = re.sub(r'_\d+$', '', candidate)
+        if shorter == candidate:
+            break
+        candidate = shorter
+    return full
 
 # ─────────────────────────────────────────────
 # SAP Logo — embedded as base64 (works on any host)
@@ -1617,17 +1633,26 @@ with st.sidebar:
 _CLOSING_POLL_ID = "EGI_CLOSING_EN_V1"
 
 
+# Known data-entry typos that should be treated as the standard closing poll identifier
+_CLOSING_POLL_ALIASES: frozenset = frozenset({"EGI_COSING_EN_V1"})
+
 def _is_closing_poll(poll_name) -> bool:
-    """Return True only for the exact standardised Closing Poll identifier."""
-    return str(poll_name).strip() == _CLOSING_POLL_ID
+    """Return True for the standardised Closing Poll identifier or its known aliases (typos)."""
+    name = str(poll_name).strip()
+    return name == _CLOSING_POLL_ID or name in _CLOSING_POLL_ALIASES
 
 
 def _is_valid_poll(poll_name) -> bool:
-    """Return False for null, blank, or 'No Name Poll' entries."""
+    """Return False for null, blank, 'No Name Poll', or non-standard closing/closure poll names."""
     if pd.isna(poll_name):
         return False
     name = str(poll_name).strip()
-    return bool(name) and name.lower() not in {"no name poll", "(no poll name)", "no poll name"}
+    if not name or name.lower() in {"no name poll", "(no poll name)", "no poll name"}:
+        return False
+    # Exclude non-standard "Closing" or "Closure" poll names that are not the standardised ID
+    if not _is_closing_poll(name) and re.search(r'\bclos(?:ing|ure|e)\b', name, re.IGNORECASE):
+        return False
+    return True
 
 
 def is_zoom_polling_format(df: pd.DataFrame) -> bool:
@@ -2313,6 +2338,9 @@ _NON_NAME_VOCAB = frozenset({
     # ── Prevent re-matching of already-redacted [Name] tokens ──────────────────
     "name",
     # ── Survey answer vocabulary ───────────────────────────────────────────────
+    # ── Proficiency / skill levels (prevent answer options from being redacted as names) ──
+    "beginner", "intermediate", "advanced", "advance", "expert", "proficient",
+    "novice", "basic", "skilled",
     "very", "highly", "somewhat", "slightly", "extremely", "totally",
     "completely", "fairly", "quite", "mostly", "partly", "partially",
     "satisfied", "dissatisfied", "neutral", "agree", "disagree",
@@ -2842,7 +2870,7 @@ def build_zoom_favorable_chart(per_question: dict) -> go.Figure:
     ))
     fig.update_layout(
         barmode="stack",
-        title=dict(text="Positive / Neutral / Negative Breakdown", font=dict(color=SAP_DARK_NAVY, size=13)),
+        title=dict(text="Favorability by Question", font=dict(color=SAP_DARK_NAVY, size=13)),
         xaxis=dict(domain=[0.40, 0.88], ticksuffix="%", range=[0, 100], showgrid=False),
         yaxis=dict(autorange="reversed", tickfont=dict(size=12), showgrid=False),
         plot_bgcolor=SAP_WHITE, paper_bgcolor=SAP_WHITE,
@@ -4005,7 +4033,7 @@ def generate_pptx_bytes(tidy: pd.DataFrame, zm: dict, score_map: dict,
         add_rect(slide, 0, 0, 13.33, 1.05, fill=C_DARK_NAVY)
         add_rect(slide, 0, 1.05, 13.33, 0.06, fill=C_BLUE)
         add_header_logo(slide, _sap_logo_data)
-        add_heading(slide, "Positive / Negative Breakdown",
+        add_heading(slide, "Favorability by Question",
                     0.35, 0.10, 10.6, 0.58, size=22, color=C_WHITE)
         add_text(slide,
                  f"{_egi_display}  ·  Positive, Neutral and Negative responses per question",
@@ -4414,7 +4442,7 @@ def build_favorable_chart(per_question):
     ))
     fig.update_layout(
         barmode="stack",
-        title=dict(text="Positive / Neutral / Negative Breakdown", font=dict(color=SAP_DARK_NAVY, size=14)),
+        title=dict(text="Favorability by Question", font=dict(color=SAP_DARK_NAVY, size=14)),
         xaxis=dict(domain=[0.40, 0.93], ticksuffix="%", range=[0, 100], gridcolor=SAP_GRAY_LIGHT),
         yaxis=dict(autorange="reversed", tickfont=dict(size=12)),
         plot_bgcolor=SAP_WHITE, paper_bgcolor=SAP_WHITE,
@@ -4672,15 +4700,116 @@ for fname, data in zoom_files.items():
     }
 
 # ─────────────────────────────────────────────
-# View selector (only shown when >1 EGI loaded)
+# Raw snapshot — preserved before the period filter modifies display_map.
 # ─────────────────────────────────────────────
-if len(display_map) > 1:
+_display_map_raw = {k: {**v, "tidy": v["tidy"].copy()} for k, v in display_map.items()}
+
+# Safe defaults — set here so Consolidated View comparison section
+# can read them even when no filter is active.
+_pf_selected_labels = []
+_pf_granularity     = "M"
+_pf_label_to_p      = {}
+
+# ─────────────────────────────────────────────
+# DISPLAY OPTIONS
+# Single section for the period filter and the view selector.
+# Period filter runs first so display_map is trimmed before the view list is built.
+# ─────────────────────────────────────────────
+st.markdown('<div class="section-title">Display Options</div>', unsafe_allow_html=True)
+
+# ── Period filter ──────────────────────────────────────────────
+_pf_all_dates = pd.concat(
+    [d["tidy"]["Start Date"] for d in display_map.values()],
+    ignore_index=True,
+).dropna()
+
+if not _pf_all_dates.empty:
+    _pf_avail_months   = sorted(_pf_all_dates.dt.to_period("M").unique())
+    _pf_avail_quarters = sorted(_pf_all_dates.dt.to_period("Q").unique())
+    _pf_month_labels   = [p.strftime("%b %Y") for p in _pf_avail_months]
+    _pf_quarter_labels = [f"Q{p.quarter} {p.year}" for p in _pf_avail_quarters]
+    _pf_month_to_p     = {p.strftime("%b %Y"): p for p in _pf_avail_months}
+    _pf_quarter_to_p   = {f"Q{p.quarter} {p.year}": p for p in _pf_avail_quarters}
+
+    _pf_type = st.radio(
+        "Period",
+        ["All Dates", "By Month", "By Quarter"],
+        horizontal=True,
+        key="pf_type",
+        help="Calendar period based on the dates present in the uploaded files.",
+    )
+
+    _pf_active         = False
+    _pf_selected_labels = []
+    _pf_active_periods  = set()
+    _pf_granularity     = "M"
+
+    if _pf_type == "By Month":
+        _pf_selected_labels = st.multiselect(
+            "Select months",
+            options=_pf_month_labels,
+            key="pf_selected_months",
+            placeholder="Choose one or more months...",
+            label_visibility="collapsed",
+        )
+        _pf_granularity    = "M"
+        _pf_label_to_p     = _pf_month_to_p
+        _pf_active         = bool(_pf_selected_labels)
+        _pf_active_periods = {_pf_month_to_p[m] for m in _pf_selected_labels}
+
+    elif _pf_type == "By Quarter":
+        _pf_selected_labels = st.multiselect(
+            "Select quarters",
+            options=_pf_quarter_labels,
+            key="pf_selected_quarters",
+            placeholder="Choose one or more quarters — e.g. Q2 2025...",
+            label_visibility="collapsed",
+        )
+        _pf_granularity    = "Q"
+        _pf_label_to_p     = _pf_quarter_to_p
+        _pf_active         = bool(_pf_selected_labels)
+        _pf_active_periods = {_pf_quarter_to_p[q] for q in _pf_selected_labels}
+
+    if _pf_active:
+        _pf_empty_egis = []
+        for _pf_ename in list(display_map.keys()):
+            _pf_t    = display_map[_pf_ename]["tidy"]
+            _pf_mask = _pf_t["Start Date"].dt.to_period(_pf_granularity).isin(_pf_active_periods)
+            _pf_filt = _pf_t[_pf_mask].reset_index(drop=True)
+            if _pf_filt.empty:
+                _pf_empty_egis.append(_pf_ename)
+            else:
+                display_map[_pf_ename] = {**display_map[_pf_ename], "tidy": _pf_filt}
+        for _pf_ename in _pf_empty_egis:
+            del display_map[_pf_ename]
+
+        if not display_map:
+            st.warning(
+                "No data found for the selected period. "
+                "Please choose different months or clear the filter."
+            )
+            st.stop()
+
+        st.markdown(
+            f"<div style='background:{SAP_LIGHT_SKY};border-left:3px solid {SAP_BLUE};"
+            f"border-radius:4px;padding:6px 14px;font-size:0.78rem;"
+            f"color:{SAP_DARK_NAVY};margin:4px 0 8px 0;'>"
+            f"<strong>Active period filter:</strong> "
+            + " &nbsp;·&nbsp; ".join(_pf_selected_labels)
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+else:
+    _pf_active = False
+
+# ── View selector ──────────────────────────────────────────────
+if len(_display_map_raw) > 1:
     view_options  = ["Consolidated View"] + list(display_map.keys())
     selected_view = st.radio(
-        "Select View",
+        "View",
         view_options,
         horizontal=True,
-        help="View a single EGI in full detail, or a consolidated comparison across all uploaded EGIs.",
+        help="Choose a single EGI for full detail, or the Consolidated View across all uploaded EGIs.",
     )
 else:
     selected_view = list(display_map.keys())[0]
@@ -4692,8 +4821,6 @@ if (
     and selected_view != "Consolidated View"
     and st.session_state.get("shared_poll_filter")
 ):
-    # User just switched from consolidated to an EGI — drop the individual
-    # filter key so Streamlit recreates the widget using the inherited default.
     st.session_state.pop("indiv_poll_type_filter", None)
 st.session_state["_prev_view"] = selected_view
 
@@ -4869,7 +4996,7 @@ if selected_view == "Consolidated View":
         _q03v_cp = f"{round(_cp_pq[_q03k_cp]['fav_pct'], 1)}%" if _q03k_cp else "N/A"
 
         st.markdown(
-            '<div class="section-title">Closing Poll — Consolidated Metrics and Score Analysis</div>',
+            '<div class="section-title">Closing Poll — Consolidated View</div>',
             unsafe_allow_html=True,
         )
         st.markdown(f"""
@@ -4907,13 +5034,395 @@ if selected_view == "Consolidated View":
         </div>
         """, unsafe_allow_html=True)
 
+        # ── Response Distribution (Consolidated Closing Poll) ──────────────
+        if _cp_sm:
+            with st.expander(
+                "Response Distribution — counts and scores per answer option "
+                f"({_n_egis_cp} EGI(s) · {_n_sess_cp} sessions)",
+                expanded=False,
+            ):
+                st.caption(
+                    "For each scored question, this table shows every answer option with "
+                    "the score assigned (1 = most negative, 5 = most positive), the aggregated "
+                    "response count across all uploaded EGIs, and the share of total responses "
+                    "for that question. Free-text questions (e.g. Q06) are excluded."
+                )
+                _cp_dist_rows = []
+                for _cpd_q, _cpd_ans_map in _cp_sm.items():
+                    _cpd_data  = _cp_tidy[_cp_tidy["Question"] == _cpd_q]
+                    _cpd_agg   = _cpd_data.groupby("Answer")["Count"].sum().reset_index()
+                    _cpd_total = int(_cpd_agg["Count"].sum())
+                    if _cpd_total == 0:
+                        continue
+                    for _cpd_ans, _cpd_sc in sorted(
+                        _cpd_ans_map.items(), key=lambda x: x[1], reverse=True
+                    ):
+                        _cpd_cnt = (
+                            int(_cpd_agg.loc[_cpd_agg["Answer"] == _cpd_ans, "Count"].sum())
+                            if not _cpd_agg.empty else 0
+                        )
+                        _cpd_pct  = round(_cpd_cnt / _cpd_total * 100, 1) if _cpd_total > 0 else 0.0
+                        _cpd_tier = (
+                            "Positive" if _cpd_sc >= 4
+                            else "Neutral" if _cpd_sc == 3
+                            else "Negative"
+                        )
+                        _cp_dist_rows.append({
+                            "Question" : _cpd_q,
+                            "Answer"   : _cpd_ans,
+                            "Score"    : _cpd_sc,
+                            "Category" : _cpd_tier,
+                            "Count"    : _cpd_cnt,
+                            "% of Q"   : f"{_cpd_pct}%",
+                        })
+                if _cp_dist_rows:
+                    from itertools import groupby as _rd_grp
+                    _rd_th   = ("background:#F0F2F6;color:#333;padding:7px 10px;"
+                                 "text-align:left;font-weight:600;border-bottom:1px solid #D0D3DA;font-size:0.82rem;")
+                    _rd_th_r = _rd_th + "text-align:right;"
+                    _rd_td_base = "padding:6px 10px;border-bottom:1px solid #E8EAED;vertical-align:middle;"
+                    _rd_colors  = ["#FFFFFF", "#F5F6FA"]
+                    _CAT_CLR    = {"Positive": "#27AE60", "Neutral": "#E67E22", "Negative": "#C0392B"}
+                    _rd_rows_html = ""
+                    for _qi, (_qk, _qg) in enumerate(_rd_grp(_cp_dist_rows, key=lambda r: r["Question"])):
+                        _ql   = list(_qg)
+                        _qspan = len(_ql)
+                        _bg   = _rd_colors[_qi % 2]
+                        _td   = f"{_rd_td_base}background:{_bg};"
+                        _td_r = _td + "text-align:right;"
+                        _cat_groups = []
+                        for _ck2, _cg2 in _rd_grp(_ql, key=lambda r: r["Category"]):
+                            _cat_groups.append((_ck2, list(_cg2)))
+                        _first = True
+                        for _ck2, _crows in _cat_groups:
+                            _cspan = len(_crows)
+                            _cclr  = _CAT_CLR.get(_ck2, "#333")
+                            for _ri, _row in enumerate(_crows):
+                                _rd_rows_html += "<tr>"
+                                if _first:
+                                    _rd_rows_html += (
+                                        f'<td style="{_td}word-wrap:break-word;white-space:normal;min-width:220px;" rowspan="{_qspan}">'
+                                        f'{_row["Question"]}</td>'
+                                    )
+                                    _first = False
+                                _rd_rows_html += (
+                                    f'<td style="{_td}">{_row["Answer"]}</td>'
+                                    f'<td style="{_td_r}">{_row["Score"]}</td>'
+                                )
+                                if _ri == 0:
+                                    _rd_rows_html += (
+                                        f'<td style="{_td};color:{_cclr};font-weight:600;" '
+                                        f'rowspan="{_cspan}">{_ck2}</td>'
+                                    )
+                                _rd_rows_html += (
+                                    f'<td style="{_td_r}">{_row["Count"]}</td>'
+                                    f'<td style="{_td_r}">{_row["% of Q"]}</td>'
+                                )
+                                _rd_rows_html += "</tr>"
+                    _rd_html = (
+                        f'<table style="width:100%;border-collapse:collapse;'
+                        f'font-size:0.82rem;font-family:Arial,sans-serif;color:#333;">'
+                        f'<thead><tr>'
+                        f'<th style="{_rd_th}">Question</th>'
+                        f'<th style="{_rd_th}">Answer</th>'
+                        f'<th style="{_rd_th_r}">Score (1–5)</th>'
+                        f'<th style="{_rd_th}">Category</th>'
+                        f'<th style="{_rd_th_r}">Responses</th>'
+                        f'<th style="{_rd_th_r}">% of Question</th>'
+                        f'</tr></thead><tbody>{_rd_rows_html}</tbody></table>'
+                    )
+                    st.markdown(_rd_html, unsafe_allow_html=True)
+                else:
+                    st.caption("No response data available for the consolidated dataset.")
+
         if _cp_pq:
-            st.caption(
-                f"Weighted mean score per question · aggregated across "
-                f"{_n_egis_cp} EGI(s) · normalised 0–100%  ·  "
-                f"blue = at or above 60% target"
+            st.markdown('<div class="section-title">Score Analysis</div>', unsafe_allow_html=True)
+            _tab1_cp, _tab2_cp, _tab3_cp = st.tabs(
+                ["Overall Scores", "Favorability by Question", "How it Works"]
             )
-            st.plotly_chart(build_zoom_score_chart(_cp_pq), use_container_width=True)
+            with _tab1_cp:
+                st.caption(
+                    f"Weighted mean score per question · aggregated across "
+                    f"{_n_egis_cp} EGI(s) · normalised 0–100%  ·  "
+                    f"blue = at or above 60% target"
+                )
+                st.plotly_chart(build_zoom_score_chart(_cp_pq), use_container_width=True)
+            with _tab2_cp:
+                st.caption(
+                    f"Favorability by question — Positive, Neutral, and Negative responses per question · aggregated across "
+                    f"{_n_egis_cp} EGI(s)"
+                )
+                st.plotly_chart(build_zoom_favorable_chart(_cp_pq), use_container_width=True)
+            with _tab3_cp:
+                # Pre-compute worked example using consolidated data
+                _ex_step2_cp, _ex_step3_cp, _ex_norms_cp = [], [], []
+                for _ex_idx_cp, (_ex_q_cp, _ex_v_cp) in enumerate(_cp_pq.items(), 1):
+                    _ex_mean_cp  = _ex_v_cp["mean"]
+                    _ex_norm_cp  = _ex_v_cp["score_norm"]
+                    _ex_total_cp = _ex_v_cp["total"]
+                    _ex_sm_cp    = _cp_sm.get(_ex_q_cp, {})
+                    _ex_agg_cp   = (
+                        _cp_tidy[_cp_tidy["Question"] == _ex_q_cp]
+                        .groupby("Answer")["Count"].sum()
+                        .reset_index()
+                    )
+                    _ex_terms_cp, _ex_num_cp = [], 0
+                    for _ex_ans_cp, _ex_sc_cp in sorted(
+                        _ex_sm_cp.items(), key=lambda x: x[1], reverse=True
+                    ):
+                        _ex_cnt_cp = int(
+                            _ex_agg_cp.loc[_ex_agg_cp["Answer"] == _ex_ans_cp, "Count"].sum()
+                        ) if not _ex_agg_cp.empty else 0
+                        if _ex_cnt_cp > 0:
+                            _ex_terms_cp.append(f"{_ex_cnt_cp}×{_ex_sc_cp}")
+                            _ex_num_cp += _ex_cnt_cp * _ex_sc_cp
+                    _ex_step2_cp.append(
+                        f"Q{_ex_idx_cp:02d}: ({' + '.join(_ex_terms_cp)}) / {_ex_total_cp} = "
+                        f"{_ex_num_cp}/{_ex_total_cp} = {_ex_mean_cp:.2f}"
+                    )
+                    _ex_step3_cp.append(
+                        f"Q{_ex_idx_cp:02d}: ({_ex_mean_cp:.2f} − 1) / 4 × 100 = {_ex_norm_cp:.1f}%"
+                    )
+                    _ex_norms_cp.append(_ex_norm_cp)
+
+                _pre_s_cp = (
+                    "background:rgba(255,255,255,0.55);border-radius:3px;padding:6px 10px;"
+                    "font-size:0.68rem;line-height:1.55;overflow-x:auto;"
+                    "margin:2px 0 10px 0;font-family:monospace;white-space:pre;"
+                )
+                _h3_s_cp = (
+                    f"margin:0 0 3px 0;font-size:0.73rem;font-weight:700;color:{SAP_DEEP_NAVY};"
+                )
+
+                if _ex_norms_cp:
+                    _ex_norms_str_cp = " + ".join(f"{v:.1f}" for v in _ex_norms_cp)
+                    _ex_overall_cp   = round(sum(_ex_norms_cp) / len(_ex_norms_cp), 1)
+                    _ex_step4_str_cp = (
+                        f"({_ex_norms_str_cp}) / {len(_ex_norms_cp)} = "
+                        f"{sum(_ex_norms_cp):.1f} / {len(_ex_norms_cp)} = {_ex_overall_cp}%"
+                    )
+                    _ex_block_cp = (
+                        f"<hr style='border:none;border-top:1px solid rgba(27,144,255,0.25);"
+                        f"margin:12px 0 10px 0;'>"
+                        f"<p style='margin:0 0 6px 0;font-size:0.80rem;font-weight:700;"
+                        f"color:{SAP_DEEP_NAVY};'>Worked example — consolidated data "
+                        f"({_n_egis_cp} EGI(s), {_n_sess_cp} sessions)</p>"
+                        f"<p style='margin:0 0 8px 0;font-size:0.70rem;color:{SAP_GRAY_DARK};'>"
+                        f"The exact steps used to produce the Overall Score shown in the KPI card above.</p>"
+                        f"<p style='{_h3_s_cp}'>Step 1 — Responses scored 1–5"
+                        f" (1 = most negative, 5 = most positive)</p>"
+                        f"<p style='margin:0 0 10px 0;font-size:0.70rem;color:{SAP_GRAY_DARK};'>"
+                        f"Each answer option is mapped to a score of 1, 2, 3, 4, or 5.</p>"
+                        f"<p style='{_h3_s_cp}'>Step 2 — Weighted average per question</p>"
+                        f"<pre style='{_pre_s_cp}'>{chr(10).join(_ex_step2_cp)}</pre>"
+                        f"<p style='{_h3_s_cp}'>Step 3 — Normalize to 0–100 %"
+                        f" <code style='font-weight:400;font-size:0.68rem;"
+                        f"background:rgba(0,0,0,0.06);padding:1px 4px;border-radius:2px;'>"
+                        f"(mean − 1) / 4 × 100</code></p>"
+                        f"<pre style='{_pre_s_cp}'>{chr(10).join(_ex_step3_cp)}</pre>"
+                        f"<p style='{_h3_s_cp}'>Step 4 — Overall Score = average of all question scores</p>"
+                        f"<pre style='{_pre_s_cp}'>{_ex_step4_str_cp}</pre>"
+                    )
+                else:
+                    _ex_block_cp = ""
+
+                st.markdown(
+                    f"<div style='background:{SAP_LIGHT_SKY};border-left:4px solid {SAP_BLUE};"
+                    f"border-radius:6px;padding:14px 18px;font-size:0.78rem;"
+                    f"color:{SAP_BLACK};line-height:1.65;'>"
+                    f"<p style='margin:0 0 10px 0;font-size:1rem;font-weight:700;"
+                    f"color:{SAP_DEEP_NAVY};'>How scores are calculated</p>"
+                    f"<p style='margin:0 0 8px 0;'>Participants respond on a <strong>1 to 5 scale</strong>"
+                    f" for each question — where <strong>1 = most negative</strong>"
+                    f" and <strong>5 = most positive</strong>.</p>"
+                    f"<p style='margin:0 0 8px 0;'>The app computes a <strong>weighted average</strong>"
+                    f" per question, then converts it to a <strong>percentage out of 100</strong> using:<br>"
+                    f"<code style='background:{SAP_GRAY_LIGHT};padding:2px 6px;border-radius:3px;'>"
+                    f"Score = (average − 1) ÷ 4 × 100"
+                    f"</code></p>"
+                    f"<p style='margin:0 0 8px 0;'>"
+                    f"<strong>Positive</strong> = scores 4–5 &nbsp;|&nbsp;"
+                    f"<strong>Neutral</strong> = score 3 &nbsp;|&nbsp;"
+                    f"<strong>Negative</strong> = scores 1–2</p>"
+                    f"<p style='margin:0 0 4px 0;'><strong>Questions covered:</strong></p>"
+                    f"<ul style='margin:4px 0 0 18px;padding:0;font-size:0.76rem;'>"
+                    f"<li><strong>Q01</strong> — Overall satisfaction with the session</li>"
+                    f"<li><strong>Q02</strong> — How valuable was the content</li>"
+                    f"<li><strong>Q03</strong> — How likely are you to implement what you learned</li>"
+                    f"<li><strong>Q04</strong> — How relevant was the content to your role</li>"
+                    f"<li><strong>Q05</strong> — Were next steps clear</li>"
+                    f"<li><strong>Q06</strong> — Open feedback (not scored)</li>"
+                    f"</ul>"
+                    + _ex_block_cp +
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+
+    # ── Period Comparison — auto-shown when ≥2 periods are selected ──────
+    if len(_pf_selected_labels) >= 2:
+        st.markdown(
+            '<div class="section-title">Period Comparison</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Aggregate closing poll rows from the already-filtered display_map
+        _pcv_cp_frames = [
+            d["tidy"][d["tidy"]["Poll"].apply(_is_closing_poll)]
+            for d in display_map.values()
+        ]
+        _pcv_cp_tidy = (
+            pd.concat(_pcv_cp_frames, ignore_index=True)
+            if any(not f.empty for f in _pcv_cp_frames)
+            else pd.DataFrame()
+        )
+
+        if _pcv_cp_tidy.empty:
+            st.info(
+                "No closing poll data found for the selected periods. "
+                "Ensure uploaded files contain EGI_CLOSING_EN_V1 poll data (note: EGI_COSING_EN_V1 typo is also accepted)."
+            )
+        else:
+            # ── Per-period compute helper ─────────────────────────────
+            def _pcv_compute_period(cp_tidy_full, period_label, label_to_p, gran):
+                p_obj  = label_to_p[period_label]
+                mask   = cp_tidy_full["Start Date"].dt.to_period(gran) == p_obj
+                tidy_p = cp_tidy_full[mask].reset_index(drop=True)
+                if tidy_p.empty:
+                    return None
+                sm_p   = build_score_map(tidy_p)
+                zm_p   = compute_zoom_metrics(tidy_p, sm_p)
+                pq_p   = zm_p.get("per_question", {})
+                n_sess = int(tidy_p["Class"].nunique())
+                n_resp = int(
+                    tidy_p.groupby(["Class", "Question"])["Count"]
+                    .sum().reset_index().groupby("Class")["Count"].max().sum()
+                )
+                overall = zm_p.get("overall_score", None)
+                q01k = next(
+                    (q for q in pq_p if re.search(r"(satisf|overall|q01)", q, re.I)), None
+                )
+                q03k = next(
+                    (q for q in pq_p if re.search(r"(likely|implement|q03)", q, re.I)), None
+                )
+                sat = round(pq_p[q01k]["fav_pct"], 1) if q01k else None
+                act = round(pq_p[q03k]["fav_pct"], 1) if q03k else None
+                return {
+                    "overall":      overall,
+                    "satisfaction": sat,
+                    "likely_act":   act,
+                    "sessions":     n_sess,
+                    "respondents":  n_resp,
+                }
+
+            # ── Compute metrics per selected period ───────────────────
+            _pcv_metrics = {}
+            for _pcv_lbl in _pf_selected_labels:
+                if _pcv_lbl in _pf_label_to_p:
+                    _pcv_metrics[_pcv_lbl] = _pcv_compute_period(
+                        _pcv_cp_tidy, _pcv_lbl, _pf_label_to_p, _pf_granularity
+                    )
+
+            _pcv_valid = [l for l in _pf_selected_labels
+                          if _pcv_metrics.get(l) is not None]
+
+            if len(_pcv_valid) < 2:
+                st.info(
+                    "Not enough closing poll data to compare the selected periods. "
+                    "Try selecting additional periods or uploading more data."
+                )
+            else:
+                _pcv_two = len(_pcv_valid) == 2   # show Change column only for exactly 2
+
+                # ── Table styles ──────────────────────────────────────
+                _pcv_th = (
+                    f"background:{SAP_LIGHT_SKY};color:{SAP_DARK_NAVY};font-weight:700;"
+                    f"padding:11px 16px;font-size:0.82rem;"
+                    f"border-bottom:2px solid {SAP_BLUE};"
+                )
+                _pcv_th_l = _pcv_th + "text-align:left;"
+                _pcv_th_c = _pcv_th + "text-align:center;"
+                _pcv_td = (
+                    f"padding:10px 16px;font-size:0.85rem;color:{SAP_DARK_NAVY};"
+                    f"border-top:1px solid {SAP_GRAY_LIGHT};"
+                )
+                _pcv_td_l = _pcv_td + "font-weight:600;text-align:left;"
+                _pcv_td_c = _pcv_td + "text-align:center;"
+
+                # ── Header row ────────────────────────────────────────
+                _pcv_table = (
+                    f"<table style='width:100%;border-collapse:collapse;margin-top:8px;'>"
+                    f"<thead><tr><th style='{_pcv_th_l}'>Metric</th>"
+                )
+                for _pcv_lbl in _pcv_valid:
+                    _pcv_table += f"<th style='{_pcv_th_c}'>{_pcv_lbl}</th>"
+                if _pcv_two:
+                    _pcv_table += f"<th style='{_pcv_th_c}'>Change</th>"
+                _pcv_table += "</tr></thead><tbody>"
+
+                # ── Data rows ─────────────────────────────────────────
+                _pcv_row_defs = [
+                    ("Overall Score",     "overall",      True),
+                    ("Satisfaction Rate", "satisfaction", True),
+                    ("Likely to Act",     "likely_act",   True),
+                    ("Sessions",          "sessions",     False),
+                    ("Total Respondents", "respondents",  False),
+                ]
+
+                for _pcv_mn, _pcv_key, _pcv_is_pct in _pcv_row_defs:
+                    _pcv_table += f"<tr><td style='{_pcv_td_l}'>{_pcv_mn}</td>"
+                    _pcv_vals = [
+                        _pcv_metrics[l].get(_pcv_key) if _pcv_metrics.get(l) else None
+                        for l in _pcv_valid
+                    ]
+                    for _pcv_v in _pcv_vals:
+                        _s = (f"{_pcv_v}%" if _pcv_is_pct else str(_pcv_v)) \
+                             if _pcv_v is not None else "N/A"
+                        _pcv_table += f"<td style='{_pcv_td_c}'>{_s}</td>"
+
+                    if _pcv_two:
+                        _a, _b = _pcv_vals[0], _pcv_vals[1]
+                        if _a is not None and _b is not None:
+                            _d = round(_b - _a, 1)
+                            if _d == 0:
+                                _ds, _dc = "no change", SAP_GRAY_MED
+                            else:
+                                _sign = "+" if _d > 0 else ""
+                                _suf  = "%" if _pcv_is_pct else ""
+                                _arr  = "↑" if _d > 0 else "↓"
+                                _dc   = SAP_BLUE if _d > 0 else "#C0392B"
+                                _ds   = f"{_sign}{_d}{_suf} {_arr}"
+                        else:
+                            _ds, _dc = "—", SAP_GRAY_MED
+                        _pcv_table += (
+                            f"<td style='{_pcv_td_c}font-weight:700;"
+                            f"color:{_dc};'>{_ds}</td>"
+                        )
+                    _pcv_table += "</tr>"
+
+                _pcv_table += "</tbody></table>"
+
+                st.markdown(
+                    f"<div style='background:{SAP_WHITE};"
+                    f"border:1px solid {SAP_GRAY_LIGHT};"
+                    f"border-radius:8px;padding:4px 0;overflow:hidden;'>"
+                    + _pcv_table
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
+
+                _pcv_note = (
+                    f"Change = {_pcv_valid[1]} minus {_pcv_valid[0]} · "
+                    if _pcv_two else
+                    f"{len(_pcv_valid)} periods · "
+                )
+                st.markdown(
+                    f"<p style='font-size:0.72rem;color:{SAP_GRAY_MED};margin-top:8px;'>"
+                    f"{_pcv_note}"
+                    f"Blue ↑ = improvement · Red ↓ = decline · "
+                    f"Metrics aggregated across all EGIs with closing poll data."
+                    f"</p>",
+                    unsafe_allow_html=True,
+                )
 
     st.markdown(
         f"<br><small style='color:{SAP_GRAY_MED};'>EKX DeepAgent · EGI Poll Analytics · "
@@ -4975,8 +5484,11 @@ st.markdown("</div>", unsafe_allow_html=True)
 
 # ── Apply filters ─────────────────────────────────────────────
 if not selected_polls:
-    st.info("Select a poll type above to view the detailed analysis.")
-    st.stop()
+    if len(all_polls) == 1:
+        selected_polls = list(all_polls)   # auto-select when only one poll type is available
+    else:
+        st.info("Select a poll type above to view the detailed analysis.")
+        st.stop()
 
 active_polls = selected_polls
 tidy = tidy_all[
@@ -5118,21 +5630,48 @@ if not is_closing_view:
                 _dc  = int(_dr["Count"])
                 _dpct = round(_dc / _dq_total * 100, 1) if _dq_total > 0 else 0.0
                 _dist_rows.append({
-                    "Question": _dq[:70],
+                    "Question": _dq,
                     "Answer"  : str(_dr["Answer"]),
                     "Count"   : _dc,
                     "% of Q"  : f"{_dpct}%",
                 })
         if _dist_rows:
-            st.dataframe(
-                pd.DataFrame(_dist_rows),
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Count" : st.column_config.NumberColumn("Responses", format="%d"),
-                    "% of Q": st.column_config.TextColumn("% of Question"),
-                },
+            from itertools import groupby as _rd_grp
+            _rd_th   = ("background:#F0F2F6;color:#333;padding:7px 10px;"
+                         "text-align:left;font-weight:600;border-bottom:1px solid #D0D3DA;font-size:0.82rem;")
+            _rd_th_r = _rd_th + "text-align:right;"
+            _rd_td_base = "padding:6px 10px;border-bottom:1px solid #E8EAED;vertical-align:middle;"
+            _rd_colors  = ["#FFFFFF", "#F5F6FA"]
+            _rd_rows_html = ""
+            for _qi, (_qk, _qg) in enumerate(_rd_grp(_dist_rows, key=lambda r: r["Question"])):
+                _ql    = list(_qg)
+                _qspan = len(_ql)
+                _bg    = _rd_colors[_qi % 2]
+                _td    = f"{_rd_td_base}background:{_bg};"
+                _td_r  = _td + "text-align:right;"
+                for _ri, _row in enumerate(_ql):
+                    _rd_rows_html += "<tr>"
+                    if _ri == 0:
+                        _rd_rows_html += (
+                            f'<td style="{_td}" rowspan="{_qspan}">{_row["Question"]}</td>'
+                        )
+                    _rd_rows_html += (
+                        f'<td style="{_td}">{_row["Answer"]}</td>'
+                        f'<td style="{_td_r}">{_row["Count"]}</td>'
+                        f'<td style="{_td_r}">{_row["% of Q"]}</td>'
+                    )
+                    _rd_rows_html += "</tr>"
+            _rd_html = (
+                f'<table style="width:100%;border-collapse:collapse;'
+                f'font-size:0.82rem;font-family:Arial,sans-serif;color:#333;">'
+                f'<thead><tr>'
+                f'<th style="{_rd_th}">Question</th>'
+                f'<th style="{_rd_th}">Answer</th>'
+                f'<th style="{_rd_th_r}">Responses</th>'
+                f'<th style="{_rd_th_r}">% of Question</th>'
+                f'</tr></thead><tbody>{_rd_rows_html}</tbody></table>'
             )
+            st.markdown(_rd_html, unsafe_allow_html=True)
         else:
             st.caption("No response data available.")
 
@@ -5156,32 +5695,74 @@ if is_closing_view:
                 pct  = round(cnt / total * 100, 1) if total > 0 else 0.0
                 tier = ("Positive" if sc >= 4 else "Neutral" if sc == 3 else "Negative")
                 dist_rows.append({
-                    "Question" : q[:70],
+                    "Question" : q,
                     "Answer"   : ans,
                     "Score"    : sc,
                     "Category" : tier,
                     "Count"    : cnt,
                     "% of Q"   : f"{pct}%",
                 })
-        df_dist = pd.DataFrame(dist_rows)
-        st.dataframe(
-            df_dist,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Score":    st.column_config.NumberColumn("Score (1–5)", format="%d"),
-                "Count":    st.column_config.NumberColumn("Responses",   format="%d"),
-                "% of Q":   st.column_config.TextColumn("% of Question"),
-                "Category": st.column_config.TextColumn("Category"),
-            }
+        from itertools import groupby as _rd_grp
+        _rd_th   = ("background:#F0F2F6;color:#333;padding:7px 10px;"
+                     "text-align:left;font-weight:600;border-bottom:1px solid #D0D3DA;font-size:0.82rem;")
+        _rd_th_r = _rd_th + "text-align:right;"
+        _rd_td_base = "padding:6px 10px;border-bottom:1px solid #E8EAED;vertical-align:middle;"
+        _rd_colors  = ["#FFFFFF", "#F5F6FA"]
+        _CAT_CLR    = {"Positive": "#27AE60", "Neutral": "#E67E22", "Negative": "#C0392B"}
+        _rd_rows_html = ""
+        for _qi, (_qk, _qg) in enumerate(_rd_grp(dist_rows, key=lambda r: r["Question"])):
+            _ql    = list(_qg)
+            _qspan = len(_ql)
+            _bg    = _rd_colors[_qi % 2]
+            _td    = f"{_rd_td_base}background:{_bg};"
+            _td_r  = _td + "text-align:right;"
+            _cat_groups = []
+            for _ck2, _cg2 in _rd_grp(_ql, key=lambda r: r["Category"]):
+                _cat_groups.append((_ck2, list(_cg2)))
+            _first = True
+            for _ck2, _crows in _cat_groups:
+                _cspan = len(_crows)
+                _cclr  = _CAT_CLR.get(_ck2, "#333")
+                for _ri, _row in enumerate(_crows):
+                    _rd_rows_html += "<tr>"
+                    if _first:
+                        _rd_rows_html += (
+                            f'<td style="{_td}" rowspan="{_qspan}">{_row["Question"]}</td>'
+                        )
+                        _first = False
+                    _rd_rows_html += (
+                        f'<td style="{_td}">{_row["Answer"]}</td>'
+                        f'<td style="{_td_r}">{_row["Score"]}</td>'
+                    )
+                    if _ri == 0:
+                        _rd_rows_html += (
+                            f'<td style="{_td};color:{_cclr};font-weight:600;" '
+                            f'rowspan="{_cspan}">{_ck2}</td>'
+                        )
+                    _rd_rows_html += (
+                        f'<td style="{_td_r}">{_row["Count"]}</td>'
+                        f'<td style="{_td_r}">{_row["% of Q"]}</td>'
+                    )
+                    _rd_rows_html += "</tr>"
+        _rd_html = (
+            f'<table style="width:100%;border-collapse:collapse;'
+            f'font-size:0.82rem;font-family:Arial,sans-serif;color:#333;">'
+            f'<thead><tr>'
+            f'<th style="{_rd_th}">Question</th>'
+            f'<th style="{_rd_th}">Answer</th>'
+            f'<th style="{_rd_th_r}">Score (1–5)</th>'
+            f'<th style="{_rd_th}">Category</th>'
+            f'<th style="{_rd_th_r}">Responses</th>'
+            f'<th style="{_rd_th_r}">% of Question</th>'
+            f'</tr></thead><tbody>{_rd_rows_html}</tbody></table>'
         )
-
+        st.markdown(_rd_html, unsafe_allow_html=True)
 
 # ── Score Analysis ─────────────────────────────────────────────
 st.markdown('<div class="section-title">Score Analysis</div>', unsafe_allow_html=True)
 
 if is_closing_view:
-    tab1, tab2, tab3 = st.tabs(["Overall Scores", "Positive / Negative Breakdown", "How it Works"])
+    tab1, tab2, tab3 = st.tabs(["Overall Scores", "Favorability by Question", "How it Works"])
     with tab1:
         st.plotly_chart(build_zoom_score_chart(pq), use_container_width=True)
     with tab2:
