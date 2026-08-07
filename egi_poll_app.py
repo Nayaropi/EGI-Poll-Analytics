@@ -1964,11 +1964,14 @@ def build_start_question_chart(
 
     n_bars   = len(y_labels)
     colors   = [_SP_BAR_COLORS[i % len(_SP_BAR_COLORS)] for i in range(n_bars)]
-    txt      = [f"{v:.0f}%" if v >= 7 else "" for v in x_vals]
+    # Show all non-zero percentages; constraintext="none" ensures even tiny bars
+    # render their label (overflowing to the right of the bar if necessary).
+    txt = [f"{v:.0f}%" if v > 0 else "" for v in x_vals]
 
-    max_lines = max((lbl.count("<br>") + 1 for lbl in y_labels), default=1)
-    row_h     = max(38, 18 * max_lines + 16)
-    h_tot     = n_bars * row_h + 60
+    # Per-bar height scales with the number of wrapped lines in each answer label.
+    # Minimum 40 px per bar; 18 px per additional line beyond the first.
+    row_heights = [max(40, lbl.count("<br>") * 18 + 40) for lbl in y_labels]
+    h_tot       = sum(row_heights) + 80   # +80 for title + axis + padding
 
     fig = go.Figure(go.Bar(
         x=x_vals, y=y_labels, orientation="h",
@@ -2937,8 +2940,10 @@ def build_response_composition_chart(tidy: pd.DataFrame, score_map: dict) -> go.
             name=SCORE_LABELS[score],
             y=wrapped_q, x=x_vals, orientation="h",
             marker_color=SCORE_COLORS[score],
-            text=[f"{v:.0f}%" if v >= 7 else "" for v in x_vals],
+            text=[f"{v:.0f}%" if v > 0 else "" for v in x_vals],
             textposition="inside",
+            insidetextanchor="middle",
+            constraintext="none",
             textfont=dict(color=SAP_WHITE if score in (1, 2, 5) else SAP_DEEP_NAVY, size=10),
             hovertemplate="<b>%{customdata[0]}</b><br><b>" + SCORE_LABELS[score] + "</b><br>%{customdata[1]}<extra></extra>",
             customdata=list(zip(questions, hover_texts)),
@@ -2951,10 +2956,14 @@ def build_response_composition_chart(tidy: pd.DataFrame, score_map: dict) -> go.
                    tickvals=[0, 25, 50, 75, 100], gridcolor=SAP_GRAY_LIGHT),
         yaxis=dict(autorange="reversed", tickfont=dict(size=12)),
         plot_bgcolor=SAP_WHITE, paper_bgcolor=SAP_WHITE,
-        legend=dict(orientation="h", yanchor="bottom", y=1.03, font=dict(size=10), traceorder="normal"),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02,
+            xanchor="left", x=0.0,
+            font=dict(size=10), traceorder="normal",
+        ),
         font=dict(family="Arial, sans-serif"),
-        margin=dict(l=_chart_left_margin(wrapped_q), r=30, t=70, b=10),
-        height=_chart_height(wrapped_q, min_row_px=60, extra_px=80),
+        margin=dict(l=_chart_left_margin(wrapped_q), r=30, t=80, b=10),
+        height=_chart_height(wrapped_q, min_row_px=60, extra_px=95),
     )
     return fig
 
@@ -2980,21 +2989,39 @@ def _wrap_label(text: str, max_chars: int = 55) -> str:
     return "<br>".join(lines_out)
 
 
-def _chart_left_margin(wrapped_labels: list, px_per_char: float = 7.8, padding: int = 28) -> int:
-    """Dynamic left margin based on the longest line in all wrapped labels."""
+def _chart_left_margin(wrapped_labels: list, px_per_char: float = 7.5, padding: int = 30) -> int:
+    """
+    Dynamic left margin sized for the longest single line across all wrapped labels.
+    Uses 7.5 px/char for Arial 12 — the default Plotly y-axis tick font.
+    Capped at 480 px to stay within a standard 700-px wide chart.
+    """
     if not wrapped_labels:
         return 220
     max_line = max(max(len(line) for line in lbl.split("<br>")) for lbl in wrapped_labels)
-    return max(180, min(440, int(max_line * px_per_char + padding)))
+    return max(180, min(480, int(max_line * px_per_char + padding)))
 
 
-def _chart_height(wrapped_labels: list, px_per_line: int = 16,
-                  min_row_px: int = 42, extra_px: int = 70) -> int:
-    """Dynamic height so multi-line labels never overlap."""
+def _chart_height(wrapped_labels: list, px_per_line: int = 18,
+                  min_row_px: int = 50, extra_px: int = 80) -> int:
+    """
+    Dynamic chart height that guarantees multi-line labels and bars never overlap.
+
+    Per-question row height:
+        max(min_row_px, extra_lines * px_per_line + min_row_px)
+    where extra_lines = number of <br> tags (additional lines beyond the first).
+
+    extra_px covers chart title (~32 px), x-axis ticks (~22 px), and
+    padding (~26 px).  Add ~28 px more for a single legend row above the chart.
+
+    Minimums:  280 px total so tiny datasets still render readably.
+    """
     if not wrapped_labels:
-        return 280
-    total = sum(max(min_row_px, lbl.count("<br>") * px_per_line + min_row_px) for lbl in wrapped_labels)
-    return max(250, total + extra_px)
+        return 300
+    total = sum(
+        max(min_row_px, lbl.count("<br>") * px_per_line + min_row_px)
+        for lbl in wrapped_labels
+    )
+    return max(280, total + extra_px)
 
 
 def build_respondent_count_chart(tidy: pd.DataFrame) -> go.Figure:
@@ -3017,6 +3044,7 @@ def build_respondent_count_chart(tidy: pd.DataFrame) -> go.Figure:
         marker_color=SAP_BLUE,
         text=bar_labels, textposition="inside",
         insidetextanchor="end",
+        constraintext="none",
         textfont=dict(size=11, color=SAP_WHITE),
         hovertemplate="<b>%{customdata}</b><br>Response rate: <b>%{x}%</b><extra></extra>",
         customdata=raw_q,
@@ -4338,6 +4366,7 @@ def build_score_bar_chart(per_question, scale):
         marker_color=bar_colors,
         text=[f"{s}%" for s in scores], textposition="inside",
         insidetextanchor="middle",
+        constraintext="none",
         textfont=dict(color=SAP_WHITE, size=11),
         hovertemplate="<b>%{customdata}</b><br>Score: %{x}%<extra></extra>",
         customdata=questions,
