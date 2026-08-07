@@ -3792,44 +3792,161 @@ def generate_pptx_bytes(tidy: pd.DataFrame, zm: dict, score_map: dict,
         t = _re.sub(r'<[^>]+>', '', str(html_str)).strip()
         return (t[:max_len] + "…") if len(t) > max_len else t
 
-    # ── Chart helper — stacked bars ───────────────────────────────
+    # ── Layout constants ──────────────────────────────────────────
+    _BODY_Y0   = 1.24    # top of content area
+    _BODY_YMAX = 6.92    # bottom of content area (above footer)
+    _FAV_Y0    = 1.38    # favorability chart starts slightly lower (header row)
+    _FAV_AXIS  = 0.65    # axis ticks + legend at bottom of fav chart
+    _FAV_X0    = 0.60
+    _FAV_W     = 11.10
+    _QHDR_H    = 0.20    # question header bar height (response analysis)
+    _QGAP      = 0.13    # gap between questions (response analysis)
+    _ANS_LBL_W = 4.30    # answer label column width
+    _BAR_X     = _FAV_X0 + _ANS_LBL_W + 0.06
+    _BAR_W     = 6.70    # horizontal bar track width
+
+    # ── Chunk helper: split pq into per-slide pieces for fav chart ─
+    def _chunk_pq(pq_dict, avail_h, min_bar_h=0.28):
+        """Return *balanced* list of OrderedDict chunks; each chunk fits on one slide.
+
+        Instead of filling slide 1 to capacity then overflowing to slide 2,
+        we compute the minimum number of slides needed and divide questions as
+        evenly as possible (ceil(N/n_slides) on early slides, floor on later).
+        """
+        import math
+        items = list(pq_dict.items())
+        n     = len(items)
+        if n == 0:
+            return []
+        # How many rows can fit on one slide while each bar stays readable?
+        max_per_slide = max(1, int(avail_h * 0.82 / min_bar_h))
+        # Minimum number of slides required
+        n_slides = math.ceil(n / max_per_slide)
+        # Balanced distribution: spread extras on the *first* slides so later
+        # slides never have more than the earlier ones.
+        base  = n // n_slides
+        extra = n % n_slides          # first `extra` slides get (base+1) items
+        chunks, i = [], 0
+        for s in range(n_slides):
+            sz = base + (1 if s < extra else 0)
+            chunks.append(dict(items[i : i + sz]))
+            i += sz
+        return chunks
+
+    # ── Layout helper: paginate response-analysis items ───────────
+    def _layout_response(q_info, base_bar_h, line_h):
+        """
+        Balanced two-pass layout: distribute questions evenly across slides
+        so no slide is disproportionately full or empty.
+
+        Pass 1 – materialise every question group and measure its height.
+        Pass 2 – assign groups to pages using a target height per page of
+                 (total_height / n_slides), cutting at question boundaries
+                 whenever possible.  Only splits a single question mid-group
+                 (with a continuation header) when that group is itself taller
+                 than one full page.
+
+        Returns a list of pages; each page is a list of typed items:
+          ("qhdr", q_txt, tot_n, height)
+          ("cont", short_q, tot_n, height)   <- continuation header
+          ("bar",  an_parts, pct, bi, tot_n, height)
+        """
+        import math
+        avail_h = _BODY_YMAX - _BODY_Y0      # usable inches per slide
+
+        # ── Pass 1: build question groups ──────────────────────────
+        q_groups = []
+        for q_txt, bars_data, tot_n in q_info:
+            rows = [("qhdr", q_txt, tot_n, _QHDR_H)]
+            gh   = _QHDR_H + _QGAP           # header + trailing gap
+            for bi, (an_txt, pct, cnt) in enumerate(bars_data):
+                parts = [p.strip() for p in str(an_txt).split(";") if p.strip()]
+                bh    = max(base_bar_h, min(0.38, max(1, len(parts)) * line_h))
+                rows.append(("bar", parts, pct, bi, tot_n, bh))
+                gh   += bh
+            q_groups.append((rows, gh, q_txt, tot_n))
+
+        if not q_groups:
+            return []
+
+        # ── Pass 2: balanced distribution ──────────────────────────
+        total_h  = sum(gh for _, gh, _, _ in q_groups)
+        n_slides = max(1, math.ceil(total_h / avail_h))
+        target_h = total_h / n_slides        # ideal content height per page
+
+        pages  = [[]]
+        cur_h  = 0.0
+
+        for grp_rows, grp_h, q_txt, tot_n in q_groups:
+
+            # ── Case A: group itself exceeds one full page → must split ──
+            if grp_h > avail_h:
+                if cur_h > 0.01:             # flush whatever is on current page
+                    pages.append([])
+                    cur_h = 0.0
+                short  = (q_txt[:44] + "…") if len(q_txt) > 44 else q_txt
+                page_h = 0.0
+                for row in grp_rows:
+                    rh = row[-1]
+                    if page_h + rh > avail_h and page_h > 0:
+                        pages.append([])
+                        page_h = 0.0
+                        pages[-1].append(("cont", short, tot_n, _QHDR_H))
+                        page_h += _QHDR_H
+                    pages[-1].append(row)
+                    page_h += rh
+                cur_h = page_h
+                continue
+
+            # ── Case B: group fits on a single page ──────────────────
+            # Hard overflow: physically won't fit → start new page
+            if cur_h + grp_h > avail_h:
+                pages.append([])
+                cur_h = 0.0
+            # Soft balance cut: we've reached the per-slide target and
+            # there are still pages left to open — cut here
+            elif cur_h >= target_h and len(pages) < n_slides:
+                pages.append([])
+                cur_h = 0.0
+
+            for row in grp_rows:
+                pages[-1].append(row)
+            cur_h += grp_h
+
+        return [p for p in pages if p]
+
+    # ── Chart helper — stacked bars (single slide) ────────────────
     def draw_stacked_bars(slide, pq_dict, x0, y0, chart_w, bar_h, gap):
-        """Stacked bar chart with axis + legend at bottom. All segment % always visible."""
+        """Render one chunk of stacked bars onto an already-created slide."""
         label_w  = 4.5
         n_lbl    = 0.70
         bar_area = chart_w - label_w - n_lbl
         _bx0     = x0 + label_w + 0.03
 
-        def _seg_label(val_pct, seg_x, seg_w, by, bar_h, inside_col, narrow_col):
-            """Three-tier label placement — every non-zero value is always readable."""
+        def _seg_label(val_pct, seg_x, seg_w, by, bh, inside_col, narrow_col):
             if val_pct <= 0:
                 return
             txt = f"{val_pct:.0f}%"
             if seg_w >= 0.28:
-                # Wide: inside bar, normal font, left-aligned
                 add_text(slide, txt,
                          seg_x + 0.04, by + 0.05,
-                         seg_w - 0.05, bar_h - 0.08,
+                         seg_w - 0.05, bh - 0.08,
                          size=6.5, bold=True, color=inside_col,
                          align=PP_ALIGN.LEFT, wrap=False)
             elif seg_w >= 0.13:
-                # Medium: inside bar, smaller font, centred
                 add_text(slide, txt,
                          seg_x + 0.02, by + 0.05,
-                         seg_w - 0.02, bar_h - 0.08,
+                         seg_w - 0.02, bh - 0.08,
                          size=5.5, bold=True, color=inside_col,
                          align=PP_ALIGN.CENTER, wrap=False)
             else:
-                # Narrow: below the bar, height capped to gap so it never bleeds
-                # into the next row
-                _lbl_h = max(0.09, min(0.13, gap - 0.04))
+                _lh = max(0.09, min(0.13, gap - 0.04))
                 add_text(slide, txt,
-                         seg_x - 0.06, by + bar_h + 0.02,
-                         max(seg_w + 0.14, 0.22), _lbl_h,
+                         seg_x - 0.06, by + bh + 0.02,
+                         max(seg_w + 0.14, 0.22), _lh,
                          size=5.0, bold=True, color=narrow_col,
                          align=PP_ALIGN.CENTER, wrap=False)
 
-        # ── Bar rows ──────────────────────────────────────────
         for i, (q, v) in enumerate(pq_dict.items()):
             by  = y0 + i * (bar_h + gap)
             bx  = _bx0
@@ -3837,35 +3954,29 @@ def generate_pptx_bytes(tidy: pd.DataFrame, zm: dict, score_map: dict,
             neu = v["neut_pct"] / 100
             unf = v["unfav_pct"] / 100
 
-            # Question label (right-aligned)
             add_text(slide, q, x0, by, label_w - 0.10, bar_h,
                      size=7.0, color=C_DARK_NAVY, align=PP_ALIGN.RIGHT, wrap=True)
 
-            # Positive segment
             fw = fav * bar_area
             if fw > 0.01:
                 add_rect(slide, bx, by, fw, bar_h, fill=C_BLUE)
                 _seg_label(v["fav_pct"], bx, fw, by, bar_h, C_WHITE, C_BLUE)
 
-            # Neutral segment
             nw = neu * bar_area
             if nw > 0.01:
                 add_rect(slide, bx + fw, by, nw, bar_h, fill=C_LIGHT_BLUE)
                 _seg_label(v["neut_pct"], bx + fw, nw, by, bar_h, C_DEEP_NAVY, C_DARK_NAVY)
 
-            # Negative segment
             uw = unf * bar_area
             if uw > 0.01:
                 add_rect(slide, bx + fw + nw, by, uw, bar_h, fill=C_DEEP_NAVY)
                 _seg_label(v["unfav_pct"], bx + fw + nw, uw, by, bar_h, C_WHITE, C_DEEP_NAVY)
 
-            # n= label
             add_text(slide, f"n = {v['total']}",
                      bx + bar_area + 0.06, by + 0.04,
                      n_lbl - 0.06, bar_h - 0.06,
                      size=6.5, color=C_DARK_NAVY)
 
-        # ── Axis + legend at BOTTOM ────────────────────────────
         _axis_y = y0 + len(pq_dict) * (bar_h + gap) + 0.08
         add_rect(slide, _bx0, _axis_y, bar_area, 0.012, fill=C_GRAY_DARK)
         for pct in [0, 20, 40, 60, 80, 100]:
@@ -3883,6 +3994,72 @@ def generate_pptx_bytes(tidy: pd.DataFrame, zm: dict, score_map: dict,
             add_rect(slide, _lx, _leg_y + 0.05, 0.16, 0.16, fill=col)
             add_text(slide, lbl, _lx + 0.22, _leg_y, 1.1, 0.26,
                      size=7.5, color=C_DARK_NAVY)
+
+    # ── Response-analysis slide renderer ──────────────────────────
+    def _render_resp_page(slide, items, base_bar_h, bar_fs, lbl_fs):
+        """Draw one page of response-analysis items onto an existing slide."""
+        cur_y = _BODY_Y0
+
+        for item in items:
+            kind = item[0]
+
+            if kind == "qhdr":
+                _, q_txt, tot_n, q_h = item
+                add_rect(slide, _FAV_X0 - 0.15, cur_y, 11.88, q_h, fill=C_LIGHT_SKY)
+                add_text(slide, q_txt, _FAV_X0 - 0.07, cur_y + 0.02,
+                         11.60, q_h - 0.04,
+                         size=7.5, bold=True, color=C_DARK_NAVY, wrap=False)
+                cur_y += q_h
+
+            elif kind == "cont":
+                _, short_q, tot_n, q_h = item
+                add_rect(slide, _FAV_X0 - 0.15, cur_y, 11.88, q_h, fill=C_LIGHT_SKY)
+                add_text(slide, f"{short_q}  (cont.)",
+                         _FAV_X0 - 0.07, cur_y + 0.02,
+                         11.60, q_h - 0.04,
+                         size=7.0, bold=True, color=C_DARK_NAVY, wrap=False)
+                cur_y += q_h
+
+            elif kind == "bar":
+                _, parts, pct, bi, tot_n, bh = item
+                clr  = _SP_CLRS[bi % len(_SP_CLRS)]
+                tclr = _SP_TXT[bi % len(_SP_TXT)]
+
+                # Answer label
+                add_multiline_text(slide, parts,
+                                   _FAV_X0 - 0.15, cur_y,
+                                   _ANS_LBL_W - 0.08, bh,
+                                   size=lbl_fs, color=C_DARK_NAVY,
+                                   align=PP_ALIGN.RIGHT)
+                # Grey track
+                add_rect(slide, _BAR_X, cur_y + bh * 0.10,
+                         _BAR_W, bh * 0.80, fill=_SOFT[0])
+                # Coloured fill
+                fw = max(0.05, pct / 100 * _BAR_W)
+                add_rect(slide, _BAR_X, cur_y + bh * 0.10,
+                         fw, bh * 0.80, fill=clr)
+                # % label — inside if bar wide enough, outside otherwise
+                if pct > 0:
+                    lbl_t = f"{pct:.0f}%"
+                    if fw >= 0.20:
+                        add_text(slide, lbl_t,
+                                 _BAR_X + 0.04, cur_y + bh * 0.12,
+                                 max(0.10, fw - 0.06), bh * 0.76,
+                                 size=bar_fs, bold=True, color=tclr,
+                                 align=PP_ALIGN.LEFT, wrap=False)
+                    else:
+                        add_text(slide, lbl_t,
+                                 _BAR_X + fw + 0.03, cur_y + bh * 0.12,
+                                 0.35, bh * 0.76,
+                                 size=bar_fs, bold=True, color=C_DARK_NAVY,
+                                 align=PP_ALIGN.LEFT, wrap=False)
+                # n= on first bar of each question
+                if bi == 0:
+                    add_text(slide, f"n={tot_n}",
+                             _BAR_X + _BAR_W + 0.08, cur_y + bh * 0.12,
+                             0.70, bh * 0.76,
+                             size=6.5, color=C_DARK_NAVY, wrap=False)
+                cur_y += bh
 
     # ════════════════════════════════════════════════════════════
     # SLIDE 1 — COVER
@@ -3938,6 +4115,51 @@ def generate_pptx_bytes(tidy: pd.DataFrame, zm: dict, score_map: dict,
              size=7, italic=True, color=C_GRAY_MED,
              align=PP_ALIGN.CENTER)
 
+    # ── Pre-compute chunks & total slides (must precede any footer call) ──
+    _fav_avail  = _BODY_YMAX - _FAV_Y0 - _FAV_AXIS   # available for bar rows
+    _fav_chunks = _chunk_pq(pq, _fav_avail) if _closing else []
+
+    # ── Pre-compute Response Analysis layout for start poll ──────────
+    if not _closing:
+        # collect _q_info early so we can count pages
+        _nft_qs_pre = [q for q in tidy["Question"].unique()
+                       if not _is_freetext_question(tidy[tidy["Question"] == q])]
+        _q_info_pre = []
+        for _nq_p in _nft_qs_pre:
+            _qd_p   = tidy[tidy["Question"] == _nq_p]
+            _agg_p  = _qd_p.groupby("Answer")["Count"].sum().reset_index()
+            _tot_p  = int(_agg_p["Count"].sum())
+            if _tot_p == 0:
+                continue
+            _agg_p["pct"] = (_agg_p["Count"] / _tot_p * 100).round(1)
+            _ans_p   = list(_agg_p["Answer"])
+            _qt_p    = _detect_start_question_type(_nq_p, _ans_p)
+            _ac_p    = dict(zip(_agg_p["Answer"], _agg_p["Count"]))
+            _sorted_p = _sort_start_answers(_qt_p, _ans_p, _ac_p)
+            _bars_p  = []
+            for _an_p in _sorted_p:
+                _r_p = _agg_p[_agg_p["Answer"] == _an_p]
+                if not _r_p.empty:
+                    _bars_p.append((str(_an_p),
+                                    float(_r_p["pct"].iloc[0]),
+                                    int(_r_p["Count"].iloc[0])))
+            if _bars_p:
+                _q_info_pre.append((_nq_p, _bars_p, _tot_p))
+
+        # Compute base bar height for pre-layout (mirrors later computation)
+        _tot_bars_pre  = sum(len(b) for _, b, _ in _q_info_pre)
+        _avail_pre     = 5.62
+        _qlbl_pre      = _QHDR_H
+        _qgap_pre      = _QGAP
+        _fixed_pre     = len(_q_info_pre) * (_qlbl_pre + _qgap_pre)
+        _bbh_pre       = max(0.13, min(0.28, (_avail_pre - _fixed_pre) / max(_tot_bars_pre, 1)))
+        _lh_pre        = 0.115
+        _resp_layout   = _layout_response(_q_info_pre, _bbh_pre, _lh_pre)
+    else:
+        _resp_layout   = []
+
+    _total_slides = (2 + len(_fav_chunks)) if _closing else (2 + len(_resp_layout))
+
     # ════════════════════════════════════════════════════════════
     # SLIDE 2 — EXECUTIVE SUMMARY  (Closing Poll only)
     # ════════════════════════════════════════════════════════════
@@ -3952,7 +4174,7 @@ def generate_pptx_bytes(tidy: pd.DataFrame, zm: dict, score_map: dict,
                  0.35, 0.10, 10.6, 0.58, size=22, color=C_WHITE)
      add_text(slide, _egi_display,
               0.35, 0.68, 10.6, 0.30, size=8.5, color=C_LIGHT_BLUE)
-     add_footer(slide, 2, 3)
+     add_footer(slide, 2, _total_slides)
 
      # ── 5 KPI cards (soft palette per card) ────────────────────
      _kpis = [
@@ -4026,26 +4248,29 @@ def generate_pptx_bytes(tidy: pd.DataFrame, zm: dict, score_map: dict,
 
     if _closing:
         # ════════════════════════════════════════════════════════════
-        # SLIDE 3 — POSITIVE / NEGATIVE BREAKDOWN  (Closing Poll)
+        # SLIDE(S) 3+ — FAVORABILITY BREAKDOWN  (Closing Poll)
         # ════════════════════════════════════════════════════════════
-        slide = prs.slides.add_slide(blank)
+        for _ci, _chunk in enumerate(_fav_chunks, start=1):
+            slide = prs.slides.add_slide(blank)
+            add_rect(slide, 0, 0, 13.33, 1.05, fill=C_DARK_NAVY)
+            add_rect(slide, 0, 1.05, 13.33, 0.06, fill=C_BLUE)
+            add_header_logo(slide, _sap_logo_data)
+            _fav_title = "Favorability by Question"
+            if len(_fav_chunks) > 1:
+                _fav_title += f"  ({_ci} of {len(_fav_chunks)})"
+            add_heading(slide, _fav_title,
+                        0.35, 0.10, 10.6, 0.58, size=22, color=C_WHITE)
+            add_text(slide,
+                     f"{_egi_display}  ·  Positive, Neutral and Negative responses per question",
+                     0.35, 0.68, 10.6, 0.30, size=8.5, color=C_LIGHT_BLUE)
+            add_footer(slide, 2 + _ci, _total_slides)
 
-        add_rect(slide, 0, 0, 13.33, 1.05, fill=C_DARK_NAVY)
-        add_rect(slide, 0, 1.05, 13.33, 0.06, fill=C_BLUE)
-        add_header_logo(slide, _sap_logo_data)
-        add_heading(slide, "Favorability by Question",
-                    0.35, 0.10, 10.6, 0.58, size=22, color=C_WHITE)
-        add_text(slide,
-                 f"{_egi_display}  ·  Positive, Neutral and Negative responses per question",
-                 0.35, 0.68, 10.6, 0.30, size=8.5, color=C_LIGHT_BLUE)
-        add_footer(slide, 3, 3)
-
-        # (v89 — margins increased, bar height capped for breathing room)
-        _n_q   = len(pq)
-        _bar_h = min(0.60, max(0.35, (4.60 - _n_q * 0.08) / max(_n_q, 1) * 0.85))
-        _gap   = max(0.12, min(0.22, _bar_h * 0.22))
-        draw_stacked_bars(slide, pq, 0.60, 1.38, 11.10,
-                          bar_h=_bar_h, gap=_gap)
+            _n_q_c  = len(_chunk)
+            _row_h  = _fav_avail / max(_n_q_c, 1)
+            _bar_h  = max(0.28, min(0.65, _row_h * 0.82))
+            _gap    = max(0.08, min(0.25, _row_h * 0.18))
+            draw_stacked_bars(slide, _chunk, _FAV_X0, _FAV_Y0, _FAV_W,
+                              bar_h=_bar_h, gap=_gap)
 
     else:
         # ════════════════════════════════════════════════════════════
@@ -4060,7 +4285,7 @@ def generate_pptx_bytes(tidy: pd.DataFrame, zm: dict, score_map: dict,
                     0.35, 0.10, 10.6, 0.58, size=22, color=C_WHITE)
         add_text(slide, _egi_display,
                  0.35, 0.68, 10.6, 0.30, size=8.5, color=C_LIGHT_BLUE)
-        add_footer(slide, 2, 3)
+        add_footer(slide, 2, _total_slides)
 
         # ── 3 KPI cards ────────────────────────────────────────────
         _avg_r = round(total_resp / max(n_sess, 1), 1)
@@ -4123,125 +4348,35 @@ def generate_pptx_bytes(tidy: pd.DataFrame, zm: dict, score_map: dict,
             _fy2 += _rh2 + 0.07
 
         # ════════════════════════════════════════════════════════════
-        # START POLL — SLIDE 3: SCORE ANALYSIS (per-question bars)
+        # START POLL — SLIDE(S) 3+: RESPONSE ANALYSIS (multi-slide)
         # ════════════════════════════════════════════════════════════
-        slide = prs.slides.add_slide(blank)
+        # _q_info_pre / _resp_layout already built above for slide count.
+        # Reuse them — no need to re-query tidy.
+        _q_info = _q_info_pre   # alias
 
-        add_rect(slide, 0, 0, 13.33, 1.05, fill=C_DARK_NAVY)
-        add_rect(slide, 0, 1.05, 13.33, 0.06, fill=C_BLUE)
-        add_header_logo(slide, _sap_logo_data)
-        add_heading(slide, "Response Analysis",
-                    0.35, 0.10, 10.6, 0.58, size=22, color=C_WHITE)
-        add_text(slide, f"{_egi_display}  ·  Response distribution per question",
-                 0.35, 0.68, 10.6, 0.30, size=8.5, color=C_LIGHT_BLUE)
-        add_footer(slide, 3, 3)
-
-        # Collect non-freetext question data
-        _nft_qs = [q for q in tidy["Question"].unique()
-                   if not _is_freetext_question(tidy[tidy["Question"] == q])]
-
-        _q_info = []   # list of (question_text, [(ans, pct, cnt), ...], total_n)
-        for _nq in _nft_qs:
-            _qd   = tidy[tidy["Question"] == _nq]
-            _agg3 = _qd.groupby("Answer")["Count"].sum().reset_index()
-            _tot3 = int(_agg3["Count"].sum())
-            if _tot3 == 0:
-                continue
-            _agg3["pct"] = (_agg3["Count"] / _tot3 * 100).round(1)
-            _ans3  = list(_agg3["Answer"])
-            _qt3   = _detect_start_question_type(_nq, _ans3)
-            _ac3   = dict(zip(_agg3["Answer"], _agg3["Count"]))
-            _sorted3 = _sort_start_answers(_qt3, _ans3, _ac3)
-            _bars3 = []
-            for _an3 in _sorted3:
-                _r3 = _agg3[_agg3["Answer"] == _an3]
-                if not _r3.empty:
-                    _bars3.append((str(_an3),
-                                   float(_r3["pct"].iloc[0]),
-                                   int(_r3["Count"].iloc[0])))
-            if _bars3:
-                _q_info.append((_nq, _bars3, _tot3))
-
-        # Dynamic bar height
         _nq3        = len(_q_info)
         _tot_bars3  = sum(len(b) for _, b, _ in _q_info)
         _avail3     = 5.62
-        _qlbl_h3    = 0.19
-        _qgap3      = 0.13
-        _fixed3     = _nq3 * (_qlbl_h3 + _qgap3)
+        _fixed3     = _nq3 * (_QHDR_H + _QGAP)
         _base_bar_h = max(0.13, min(0.28, (_avail3 - _fixed3) / max(_tot_bars3, 1)))
         _bar_fs3    = 6.5 if _base_bar_h >= 0.17 else 5.0
         _lbl_fs3    = max(5.0, _bar_fs3 - 0.5)
-        _line_h3    = 0.115   # inches per line at ~6 pt with 1.2× leading
+        _line_h3    = 0.115
 
-        # Layout constants
-        _x3_start   = 0.45
-        _ans_lbl_w3 = 4.30          # widened from 3.55 → more room for long answer labels
-        _bar_x3     = _x3_start + _ans_lbl_w3 + 0.06
-        _bar_w3     = 6.70          # reduced from 7.45 to compensate
-        _cur_y3     = 1.24
-
-        for _qi3, (_nq3_txt, _bars3_data, _tot3_n) in enumerate(_q_info):
-            # Question header row  (v90 — light-sky fill, dark navy text; distinct from bars)
-            _qs3 = (_nq3_txt[:88] + "…") if len(_nq3_txt) > 88 else _nq3_txt
-            add_rect(slide, _x3_start, _cur_y3, 11.88, _qlbl_h3, fill=C_LIGHT_SKY)
-            add_text(slide, _qs3, _x3_start + 0.08, _cur_y3 + 0.02,
-                     11.60, _qlbl_h3 - 0.04,
-                     size=7.5, bold=True, color=C_DARK_NAVY, wrap=False)
-            _cur_y3 += _qlbl_h3
-
-            # Answer bars
-            for _bi3, (_an3_txt, _pct3, _cnt3) in enumerate(_bars3_data):
-                # Split multi-select answers on ";" so each option gets its own line
-                _ans_parts3 = [p.strip() for p in str(_an3_txt).split(";") if p.strip()]
-                _n_parts3   = max(1, len(_ans_parts3))
-                # Per-bar height scales with number of label lines; never shrinks below base
-                _this_bar_h = max(_base_bar_h, min(0.38, _n_parts3 * _line_h3))
-                # Safety: stop if next bar would exceed slide body
-                if _cur_y3 + _this_bar_h > 6.90:
-                    break
-
-                _clr3  = _SP_CLRS[_bi3 % len(_SP_CLRS)]
-                _tclr3 = _SP_TXT[_bi3 % len(_SP_TXT)]
-
-                # Answer label — multi-line, one paragraph per option, right-aligned
-                add_multiline_text(slide, _ans_parts3,
-                                   _x3_start, _cur_y3, _ans_lbl_w3 - 0.08, _this_bar_h,
-                                   size=_lbl_fs3, color=C_DARK_NAVY,
-                                   align=PP_ALIGN.RIGHT)
-                # Track
-                add_rect(slide, _bar_x3, _cur_y3 + _this_bar_h * 0.10,
-                         _bar_w3, _this_bar_h * 0.80, fill=_SOFT[0])
-                # Fill
-                _fw3 = max(0.05, _pct3 / 100 * _bar_w3)
-                add_rect(slide, _bar_x3, _cur_y3 + _this_bar_h * 0.10,
-                         _fw3, _this_bar_h * 0.80, fill=_clr3)
-                # % label: dynamic — inside when bar is wide enough, outside when narrow
-                if _pct3 > 0:
-                    _lbl_txt3 = f"{_pct3:.0f}%"
-                    if _fw3 >= 0.20:
-                        # Inside bar — room for label
-                        add_text(slide, _lbl_txt3,
-                                 _bar_x3 + 0.04, _cur_y3 + _this_bar_h * 0.12,
-                                 max(0.10, _fw3 - 0.06), _this_bar_h * 0.76,
-                                 size=_bar_fs3, bold=True, color=_tclr3,
-                                 align=PP_ALIGN.LEFT, wrap=False)
-                    else:
-                        # Outside bar — to the right of the fill, on the grey track
-                        add_text(slide, _lbl_txt3,
-                                 _bar_x3 + _fw3 + 0.03, _cur_y3 + _this_bar_h * 0.12,
-                                 0.35, _this_bar_h * 0.76,
-                                 size=_bar_fs3, bold=True, color=C_DARK_NAVY,
-                                 align=PP_ALIGN.LEFT, wrap=False)
-                # n= label on first bar only
-                if _bi3 == 0:
-                    add_text(slide, f"n={_tot3_n}",
-                             _bar_x3 + _bar_w3 + 0.08, _cur_y3 + _this_bar_h * 0.12,
-                             0.70, _this_bar_h * 0.76,
-                             size=6.5, color=C_DARK_NAVY, wrap=False)
-                _cur_y3 += _this_bar_h
-
-            _cur_y3 += _qgap3
+        for _ri, _page_items in enumerate(_resp_layout, start=1):
+            slide = prs.slides.add_slide(blank)
+            add_rect(slide, 0, 0, 13.33, 1.05, fill=C_DARK_NAVY)
+            add_rect(slide, 0, 1.05, 13.33, 0.06, fill=C_BLUE)
+            add_header_logo(slide, _sap_logo_data)
+            _ra_title = "Response Analysis"
+            if len(_resp_layout) > 1:
+                _ra_title += f"  ({_ri} of {len(_resp_layout)})"
+            add_heading(slide, _ra_title,
+                        0.35, 0.10, 10.6, 0.58, size=22, color=C_WHITE)
+            add_text(slide, f"{_egi_display}  ·  Response distribution per question",
+                     0.35, 0.68, 10.6, 0.30, size=8.5, color=C_LIGHT_BLUE)
+            add_footer(slide, 2 + _ri, _total_slides)
+            _render_resp_page(slide, _page_items, _base_bar_h, _bar_fs3, _lbl_fs3)
 
     # ── Serialise ─────────────────────────────────────────────
     buf = _io.BytesIO()
