@@ -1309,10 +1309,8 @@ def _load_egi_names() -> tuple:
                 with open(_p, "r", encoding="utf-8") as _f:
                     _data = _json.load(_f)
                 if isinstance(_data, dict) and "lookup" in _data:
-                    _merged = {**_EGI_LOOKUP_FALLBACK, **_data["lookup"]}
-                    return _merged, True
-                _merged = {**_EGI_LOOKUP_FALLBACK, **_data}
-                return _merged, True
+                    return _data["lookup"], True
+                return _data, True
         except Exception:
             pass
     return _EGI_LOOKUP_FALLBACK, False
@@ -1321,23 +1319,9 @@ EGI_NAME_LOOKUP, _EGI_JSON_FOUND = _load_egi_names()
 
 
 def extract_learning_hub_id(filename: str) -> str:
-    """Extract the Learning Hub Item ID from a filename.
-    Tries progressively shorter suffix variants until a lookup hit is found,
-    so filenames like SUP_EDE_0090_1712_001.xlsx resolve to the correct 4-part key.
-    """
+    """Extract the Learning Hub Item ID (e.g. SUP_EDE_00012366 or SUP_EDE_00012366_001) from a filename."""
     m = re.search(r'([A-Z]{2,}_[A-Z]{2,}_\d+(?:_\d+)*)', filename, re.IGNORECASE)
-    if not m:
-        return ""
-    full = m.group(1).upper()
-    candidate = full
-    while True:
-        if candidate in EGI_NAME_LOOKUP:
-            return candidate
-        shorter = re.sub(r'_\d+$', '', candidate)
-        if shorter == candidate:
-            break
-        candidate = shorter
-    return full
+    return m.group(1).upper() if m else ""
 
 # ─────────────────────────────────────────────
 # SAP Logo — embedded as base64 (works on any host)
@@ -1633,26 +1617,41 @@ with st.sidebar:
 _CLOSING_POLL_ID = "EGI_CLOSING_EN_V1"
 
 
-# Known data-entry typos that should be treated as the standard closing poll identifier
-_CLOSING_POLL_ALIASES: frozenset = frozenset({"EGI_COSING_EN_V1"})
-
 def _is_closing_poll(poll_name) -> bool:
-    """Return True for the standardised Closing Poll identifier or its known aliases (typos)."""
-    name = str(poll_name).strip()
-    return name == _CLOSING_POLL_ID or name in _CLOSING_POLL_ALIASES
+    """Return True only for the exact standardised Closing Poll identifier."""
+    return str(poll_name).strip() == _CLOSING_POLL_ID
 
 
 def _is_valid_poll(poll_name) -> bool:
-    """Return False for null, blank, 'No Name Poll', or non-standard closing/closure poll names."""
+    """Return False for null, blank, or 'No Name Poll' entries."""
     if pd.isna(poll_name):
         return False
     name = str(poll_name).strip()
-    if not name or name.lower() in {"no name poll", "(no poll name)", "no poll name"}:
-        return False
-    # Exclude non-standard "Closing" or "Closure" poll names that are not the standardised ID
-    if not _is_closing_poll(name) and re.search(r'\bclos(?:ing|ure|e)\b', name, re.IGNORECASE):
-        return False
-    return True
+    return bool(name) and name.lower() not in {"no name poll", "(no poll name)", "no poll name"}
+
+
+_ACCEPTED_POLL_PAT = re.compile(
+    r'\bstart\b|\bopening\b|\bday\s*\d+',
+    re.IGNORECASE
+)
+
+
+def _is_accepted_poll(poll_name) -> bool:
+    """Return True only for polls included in the analysis.
+
+    Accepted:
+      • The standardised Closing Poll (EGI_CLOSING_EN_V1)
+      • Any Start-type poll — name contains the word 'start'
+        (e.g. 'Start', 'Start Poll', 'Start Session', 'EGI_START_...')
+      • Opening polls — name contains the word 'opening'
+        (e.g. 'Opening Poll')
+      • Day-N polls — name contains 'day' followed by a number
+        (e.g. 'Day 1 Poll', 'Day 2', 'Day1')
+
+    Excluded (among others): Feedback, Closure, Session Closure,
+    Overall Feedback, and any other non-standard poll types.
+    """
+    return _is_closing_poll(poll_name) or bool(_ACCEPTED_POLL_PAT.search(str(poll_name).strip()))
 
 
 def is_zoom_polling_format(df: pd.DataFrame) -> bool:
@@ -2338,9 +2337,6 @@ _NON_NAME_VOCAB = frozenset({
     # ── Prevent re-matching of already-redacted [Name] tokens ──────────────────
     "name",
     # ── Survey answer vocabulary ───────────────────────────────────────────────
-    # ── Proficiency / skill levels (prevent answer options from being redacted as names) ──
-    "beginner", "intermediate", "advanced", "advance", "expert", "proficient",
-    "novice", "basic", "skilled",
     "very", "highly", "somewhat", "slightly", "extremely", "totally",
     "completely", "fairly", "quite", "mostly", "partly", "partially",
     "satisfied", "dissatisfied", "neutral", "agree", "disagree",
@@ -2475,6 +2471,13 @@ _LEAD_PERSON_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Pattern: "Thank you to Name", "Thanks Name", "Thank you Name Surname", etc.
+# Catches names that follow gratitude expressions — common vector for leaking names.
+_THANK_RE = re.compile(
+    r'\b[Tt]hank(?:s|ing)?\s+(?:you\s+)?(?:to\s+)?'
+    r'([A-Z][a-zA-Z]{2,19}(?:\s+[A-Z][a-zA-Z]{2,19})?)\b'
+)
+
 
 def _looks_like_name(text: str) -> bool:
     """
@@ -2547,6 +2550,14 @@ def _redact_names_in_text(text: str, known_names: frozenset = frozenset()) -> tu
         return m.group(0)
 
     new_text = _HONORIFIC_RE.sub(_replace_honorific, text)
+
+    # Redact names in "Thank you to Name" / "Thanks Name" / "Thank you Name Surname" patterns.
+    def _replace_thank(m: re.Match) -> str:
+        name = m.group(1)
+        if name.lower() not in _NON_NAME_VOCAB:
+            return m.group(0).replace(name, "[Name]")
+        return m.group(0)
+    new_text = _THANK_RE.sub(_replace_thank, new_text)
 
     # Redact names in sentences like "Syrus is one of the best instructors."
     # Only fires when the same sentence contains an instructor-evaluation keyword.
@@ -2812,12 +2823,12 @@ def build_zoom_score_chart(per_question: dict) -> go.Figure:
     ))
     fig.update_layout(
         title=dict(text="Overall Score per Question (0–100%)", font=dict(color=SAP_DARK_NAVY, size=13)),
-        xaxis=dict(domain=[0.40, 0.90], range=[0, 100], ticksuffix="%", showgrid=False),
+        xaxis=dict(range=[0, 100], ticksuffix="%", showgrid=False),
         yaxis=dict(autorange="reversed", tickfont=dict(size=12), showgrid=False),
         plot_bgcolor=SAP_WHITE, paper_bgcolor=SAP_WHITE,
         font=dict(family="Arial, sans-serif", color=SAP_BLACK),
-        margin=dict(l=10, r=10, t=45, b=10),
-        height=_chart_height(wrapped_q),
+        margin=dict(l=_chart_left_margin(wrapped_q), r=30, t=45, b=20),
+        height=_chart_height(wrapped_q, min_row_px=60, extra_px=80),
         shapes=[dict(type="line", x0=60, x1=60, y0=-0.5, y1=len(questions)-0.5,
                      line=dict(color=SAP_GRAY_MED, width=1.5, dash="dot"),
                      xref="x", yref="y")],
@@ -2841,8 +2852,9 @@ def build_zoom_favorable_chart(per_question: dict) -> go.Figure:
     fig.add_trace(go.Bar(
         name="Positive",  y=wrapped_q, x=fav_vals,   orientation="h",
         marker_color=SAP_BLUE,
-        text=[f"{v:.0f}%" for v in fav_vals],
+        text=[f"{v:.0f}%" if v > 0 else "" for v in fav_vals],
         textposition="inside", insidetextanchor="middle",
+        constraintext="none",
         textangle=0,
         textfont=dict(color=SAP_WHITE, size=10),
         hovertemplate="%{customdata}<extra></extra>",
@@ -2851,8 +2863,9 @@ def build_zoom_favorable_chart(per_question: dict) -> go.Figure:
     fig.add_trace(go.Bar(
         name="Neutral",   y=wrapped_q, x=neut_vals,  orientation="h",
         marker_color=SAP_LIGHT_BLUE,
-        text=[f"{v:.0f}%" for v in neut_vals],
+        text=[f"{v:.0f}%" if v > 0 else "" for v in neut_vals],
         textposition="inside", insidetextanchor="middle",
+        constraintext="none",
         textangle=0,
         textfont=dict(color=SAP_DEEP_NAVY, size=10),
         hovertemplate="%{customdata}<extra></extra>",
@@ -2861,8 +2874,9 @@ def build_zoom_favorable_chart(per_question: dict) -> go.Figure:
     fig.add_trace(go.Bar(
         name="Negative",  y=wrapped_q, x=unfav_vals, orientation="h",
         marker_color=SAP_DEEP_NAVY,
-        text=[f"{v:.0f}%" for v in unfav_vals],
+        text=[f"{v:.0f}%" if v > 0 else "" for v in unfav_vals],
         textposition="inside", insidetextanchor="middle",
+        constraintext="none",
         textangle=0,
         textfont=dict(color=SAP_WHITE, size=10),
         hovertemplate="%{customdata}<extra></extra>",
@@ -2871,20 +2885,23 @@ def build_zoom_favorable_chart(per_question: dict) -> go.Figure:
     fig.update_layout(
         barmode="stack",
         title=dict(text="Favorability by Question", font=dict(color=SAP_DARK_NAVY, size=13)),
-        xaxis=dict(domain=[0.40, 0.88], ticksuffix="%", range=[0, 100], showgrid=False),
+        xaxis=dict(range=[0, 100], ticksuffix="%", showgrid=False),
         yaxis=dict(autorange="reversed", tickfont=dict(size=12), showgrid=False),
         plot_bgcolor=SAP_WHITE, paper_bgcolor=SAP_WHITE,
-        legend=dict(orientation="v", x=0.01, xanchor="left",
-                    yanchor="middle", y=0.5,
-                    font=dict(size=13), traceorder="normal"),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom", y=1.02,
+            xanchor="left", x=0.0,
+            font=dict(size=12), traceorder="normal",
+        ),
         font=dict(family="Arial, sans-serif"),
-        margin=dict(l=10, r=10, t=40, b=10),
-        height=_chart_height(wrapped_q, extra_px=110),
+        margin=dict(l=_chart_left_margin(wrapped_q), r=80, t=70, b=20),
+        height=_chart_height(wrapped_q, min_row_px=60, extra_px=95),
     )
     for i, t in enumerate(totals):
         fig.add_annotation(
-            xref="paper", x=0.895,
-            yref="y",     y=wrapped_q[i],
+            xref="x", x=104,
+            yref="y",  y=wrapped_q[i],
             text=f"n={t}",
             showarrow=False,
             font=dict(size=9, color=SAP_GRAY_DARK),
@@ -2930,14 +2947,14 @@ def build_response_composition_chart(tidy: pd.DataFrame, score_map: dict) -> go.
         barmode="stack",
         title=dict(text="Response Composition per Question  (left = negative → right = positive)",
                    font=dict(color=SAP_DARK_NAVY, size=13)),
-        xaxis=dict(domain=[0.40, 0.93], ticksuffix="%", range=[0, 100],
+        xaxis=dict(ticksuffix="%", range=[0, 100],
                    tickvals=[0, 25, 50, 75, 100], gridcolor=SAP_GRAY_LIGHT),
         yaxis=dict(autorange="reversed", tickfont=dict(size=12)),
         plot_bgcolor=SAP_WHITE, paper_bgcolor=SAP_WHITE,
         legend=dict(orientation="h", yanchor="bottom", y=1.03, font=dict(size=10), traceorder="normal"),
         font=dict(family="Arial, sans-serif"),
-        margin=dict(l=10, r=10, t=70, b=10),
-        height=_chart_height(wrapped_q, extra_px=110),
+        margin=dict(l=_chart_left_margin(wrapped_q), r=30, t=70, b=10),
+        height=_chart_height(wrapped_q, min_row_px=60, extra_px=80),
     )
     return fig
 
@@ -3006,12 +3023,12 @@ def build_respondent_count_chart(tidy: pd.DataFrame) -> go.Figure:
     ))
     fig.update_layout(
         title=dict(text="Respondents per Question", font=dict(color=SAP_DARK_NAVY, size=13)),
-        xaxis=dict(domain=[0.40, 0.93], title="Response Rate", range=[0, 100],
+        xaxis=dict(title="Response Rate", range=[0, 100],
                    ticksuffix="%", showgrid=False),
         yaxis=dict(autorange="reversed", tickfont=dict(size=12), showgrid=False),
         plot_bgcolor=SAP_WHITE, paper_bgcolor=SAP_WHITE,
         font=dict(family="Arial, sans-serif", color=SAP_BLACK),
-        margin=dict(l=10, r=10, t=45, b=10),
+        margin=dict(l=_chart_left_margin(wrapped_q), r=30, t=45, b=10),
         height=_chart_height(wrapped_q),
     )
     return fig
@@ -3129,7 +3146,7 @@ def generate_zoom_insights(zm: dict, tidy: pd.DataFrame, score_map: dict) -> lis
                 "type": "neutral", "priority": "LOW",
                 "title": "Relative Improvement Opportunity",
                 "text": (
-                    f"All scored dimensions exceed the 60 % satisfaction target. "
+                    f"All scored dimensions are performing above the satisfaction benchmark. "
                     f"The <strong>{bot_label}</strong> dimension shows the most room for further growth "
                     f"relative to other topics, though it already meets the performance benchmark."
                 ),
@@ -3222,9 +3239,9 @@ def generate_zoom_insights(zm: dict, tidy: pd.DataFrame, score_map: dict) -> lis
         prio_low   = "HIGH" if n_low >= 3 else "MEDIUM"
         insights.append({
             "type": "warning", "priority": prio_low,
-            "title": f"{n_low} Dimension(s) with Below-Threshold Positive Responses",
+            "title": "Key Dimensions Below Satisfaction Threshold",
             "text": (
-                f"{n_low} dimension(s) received a comparatively low share of positive responses, "
+                f"Several dimensions received a comparatively low share of positive responses, "
                 f"including {ex_labels}. "
                 f"These represent the most significant improvement opportunities in the current dataset."
             ),
@@ -3694,6 +3711,26 @@ def generate_pptx_bytes(tidy: pd.DataFrame, zm: dict, score_map: dict,
         return add_text(slide, text, x, y, w, h, size=size, bold=False,
                         color=color, align=align, wrap=wrap, name="72 Brand Medium")
 
+    def add_multiline_text(slide, lines, x, y, w, h,
+                           size=10, bold=False, color=None,
+                           align=PP_ALIGN.LEFT, name="72 Brand"):
+        """Text box with one paragraph per item in `lines` (supports multi-line labels)."""
+        from pptx.util import Pt as _Pt2
+        tb = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+        tf = tb.text_frame
+        tf.word_wrap = False
+        for i, line in enumerate(lines):
+            p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+            p.alignment = align
+            run = p.add_run()
+            run.text = str(line).strip()
+            run.font.size = _Pt2(size)
+            run.font.bold = bold
+            run.font.name = name
+            if color:
+                run.font.color.rgb = color
+        return tb
+
     def add_footer(slide, page_num, total=4):
         add_text(slide, "SAP Internal",
                  0.35, 7.20, 1.6, 0.22, size=7, color=C_GRAY_MED)
@@ -3736,7 +3773,7 @@ def generate_pptx_bytes(tidy: pd.DataFrame, zm: dict, score_map: dict,
         _bx0     = x0 + label_w + 0.03
 
         def _seg_label(val_pct, seg_x, seg_w, by, bar_h, inside_col, narrow_col):
-            """Three-tier label placement so every value is always readable."""
+            """Three-tier label placement — every non-zero value is always readable."""
             if val_pct <= 0:
                 return
             txt = f"{val_pct:.0f}%"
@@ -3755,11 +3792,13 @@ def generate_pptx_bytes(tidy: pd.DataFrame, zm: dict, score_map: dict,
                          size=5.5, bold=True, color=inside_col,
                          align=PP_ALIGN.CENTER, wrap=False)
             else:
-                # Narrow: BELOW the bar (sits in the gap row), centred on segment
+                # Narrow: below the bar, height capped to gap so it never bleeds
+                # into the next row
+                _lbl_h = max(0.09, min(0.13, gap - 0.04))
                 add_text(slide, txt,
                          seg_x - 0.06, by + bar_h + 0.02,
-                         max(seg_w + 0.14, 0.22), 0.16,
-                         size=6, bold=True, color=narrow_col,
+                         max(seg_w + 0.14, 0.22), _lbl_h,
+                         size=5.0, bold=True, color=narrow_col,
                          align=PP_ALIGN.CENTER, wrap=False)
 
         # ── Bar rows ──────────────────────────────────────────
@@ -3885,7 +3924,7 @@ def generate_pptx_bytes(tidy: pd.DataFrame, zm: dict, score_map: dict,
                  0.35, 0.10, 10.6, 0.58, size=22, color=C_WHITE)
      add_text(slide, _egi_display,
               0.35, 0.68, 10.6, 0.30, size=8.5, color=C_LIGHT_BLUE)
-     add_footer(slide, 2)
+     add_footer(slide, 2, 3)
 
      # ── 5 KPI cards (soft palette per card) ────────────────────
      _kpis = [
@@ -3959,74 +3998,7 @@ def generate_pptx_bytes(tidy: pd.DataFrame, zm: dict, score_map: dict,
 
     if _closing:
         # ════════════════════════════════════════════════════════════
-        # SLIDE 3 — SCORE ANALYSIS  (Closing Poll)
-        # ════════════════════════════════════════════════════════════
-        slide = prs.slides.add_slide(blank)
-
-        # Header
-        add_rect(slide, 0, 0, 13.33, 1.05, fill=C_DARK_NAVY)
-        add_rect(slide, 0, 1.05, 13.33, 0.06, fill=C_BLUE)
-        add_header_logo(slide, _sap_logo_data)
-        add_heading(slide, "Score Analysis",
-                    0.35, 0.10, 10.6, 0.58, size=22, color=C_WHITE)
-        add_text(slide,
-                 f"{_egi_display}  ·  Weighted mean score per question (1–5 scale → normalised 0–100%)",
-                 0.35, 0.68, 10.6, 0.30, size=8.5, color=C_LIGHT_BLUE)
-        add_footer(slide, 3)
-
-        # Score bars  (v90 — slot-based sizing: bars fill 80% of available height)
-        _sc_y   = 1.38
-        _sc_x   = 0.45
-        _sc_w   = 12.43
-        _lbl_w  = 5.50
-        _bar_w  = _sc_w - _lbl_w - 0.55
-        _axis_h = 0.74           # height consumed by axis line + tick labels + target note
-        _avail_sc = 5.52 - _axis_h   # 4.78" for bars + gaps
-        _slot_h = _avail_sc / max(len(pq), 1)
-        _row_h  = min(0.68, max(0.28, _slot_h * 0.80))
-        _row_g  = max(0.08, _slot_h * 0.20)
-
-        for i, (q, v) in enumerate(pq.items()):
-            _by  = _sc_y + i * (_row_h + _row_g)
-            _sc  = v["score_norm"] / 100
-            _bx  = _sc_x + _lbl_w + 0.03
-            add_text(slide, q, _sc_x, _by, _lbl_w - 0.08, _row_h,
-                     size=7.0, color=C_DARK_NAVY, align=PP_ALIGN.RIGHT, wrap=True)
-            # Background track — soft palette
-            add_rect(slide, _bx, _by + _row_h * 0.15,
-                     _bar_w, _row_h * 0.70, fill=_SOFT[0])
-            # Score fill
-            _fill_w = max(_sc * _bar_w, 0.05)
-            _fill_c = C_BLUE if v["score_norm"] >= 60 else C_DEEP_NAVY
-            add_rect(slide, _bx, _by + _row_h * 0.15,
-                     _fill_w, _row_h * 0.70, fill=_fill_c)
-            # 60% target line
-            _tgt_x = _bx + 0.60 * _bar_w
-            add_rect(slide, _tgt_x - 0.015, _by, 0.03, _row_h, fill=C_GRAY_MED)
-            # Score label
-            _score_txt = f"{v['score_norm']:.0f}%"
-            add_text(slide, _score_txt,
-                     _bx + 0.04, _by + 0.04, _fill_w + 0.30, _row_h - 0.06,
-                     size=7, bold=True, color=C_WHITE, align=PP_ALIGN.LEFT, wrap=False)
-            # n label
-            add_text(slide, f"n={v['total']}",
-                     _bx + _bar_w + 0.06, _by + 0.04, 0.48, _row_h - 0.06,
-                     size=6.5, color=C_DARK_NAVY)
-
-        # Axis + 60% target annotation
-        _ax_y = _sc_y + len(pq) * (_row_h + _row_g) + 0.06
-        add_rect(slide, _sc_x + _lbl_w + 0.03, _ax_y, _bar_w, 0.012, fill=C_GRAY_DARK)
-        for _pct in [0, 20, 40, 60, 80, 100]:
-            _tx = _sc_x + _lbl_w + 0.03 + _pct / 100 * _bar_w
-            add_text(slide, f"{_pct}%", _tx - 0.22, _ax_y + 0.05,
-                     0.44, 0.20, size=6, color=C_GRAY_DARK,
-                     align=PP_ALIGN.CENTER, wrap=False)
-        _tgt_ax = _sc_x + _lbl_w + 0.03 + 0.60 * _bar_w
-        add_text(slide, "60% target", _tgt_ax - 0.50, _ax_y + 0.30, 1.0, 0.22,
-                 size=6.5, italic=True, color=C_GRAY_MED, align=PP_ALIGN.CENTER)
-
-        # ════════════════════════════════════════════════════════════
-        # SLIDE 4 — POSITIVE / NEGATIVE BREAKDOWN  (Closing Poll)
+        # SLIDE 3 — POSITIVE / NEGATIVE BREAKDOWN  (Closing Poll)
         # ════════════════════════════════════════════════════════════
         slide = prs.slides.add_slide(blank)
 
@@ -4038,7 +4010,7 @@ def generate_pptx_bytes(tidy: pd.DataFrame, zm: dict, score_map: dict,
         add_text(slide,
                  f"{_egi_display}  ·  Positive, Neutral and Negative responses per question",
                  0.35, 0.68, 10.6, 0.30, size=8.5, color=C_LIGHT_BLUE)
-        add_footer(slide, 4)
+        add_footer(slide, 3, 3)
 
         # (v89 — margins increased, bar height capped for breathing room)
         _n_q   = len(pq)
@@ -4060,7 +4032,7 @@ def generate_pptx_bytes(tidy: pd.DataFrame, zm: dict, score_map: dict,
                     0.35, 0.10, 10.6, 0.58, size=22, color=C_WHITE)
         add_text(slide, _egi_display,
                  0.35, 0.68, 10.6, 0.30, size=8.5, color=C_LIGHT_BLUE)
-        add_footer(slide, 2)
+        add_footer(slide, 2, 3)
 
         # ── 3 KPI cards ────────────────────────────────────────────
         _avg_r = round(total_resp / max(n_sess, 1), 1)
@@ -4130,11 +4102,11 @@ def generate_pptx_bytes(tidy: pd.DataFrame, zm: dict, score_map: dict,
         add_rect(slide, 0, 0, 13.33, 1.05, fill=C_DARK_NAVY)
         add_rect(slide, 0, 1.05, 13.33, 0.06, fill=C_BLUE)
         add_header_logo(slide, _sap_logo_data)
-        add_heading(slide, "Score Analysis",
+        add_heading(slide, "Response Analysis",
                     0.35, 0.10, 10.6, 0.58, size=22, color=C_WHITE)
         add_text(slide, f"{_egi_display}  ·  Response distribution per question",
                  0.35, 0.68, 10.6, 0.30, size=8.5, color=C_LIGHT_BLUE)
-        add_footer(slide, 3)
+        add_footer(slide, 3, 3)
 
         # Collect non-freetext question data
         _nft_qs = [q for q in tidy["Question"].unique()
@@ -4169,14 +4141,16 @@ def generate_pptx_bytes(tidy: pd.DataFrame, zm: dict, score_map: dict,
         _qlbl_h3    = 0.19
         _qgap3      = 0.13
         _fixed3     = _nq3 * (_qlbl_h3 + _qgap3)
-        _bar_h3     = max(0.13, min(0.28, (_avail3 - _fixed3) / max(_tot_bars3, 1)))
-        _bar_fs3    = 6.5 if _bar_h3 >= 0.17 else 5.0
+        _base_bar_h = max(0.13, min(0.28, (_avail3 - _fixed3) / max(_tot_bars3, 1)))
+        _bar_fs3    = 6.5 if _base_bar_h >= 0.17 else 5.0
+        _lbl_fs3    = max(5.0, _bar_fs3 - 0.5)
+        _line_h3    = 0.115   # inches per line at ~6 pt with 1.2× leading
 
         # Layout constants
         _x3_start   = 0.45
-        _ans_lbl_w3 = 3.55
+        _ans_lbl_w3 = 4.30          # widened from 3.55 → more room for long answer labels
         _bar_x3     = _x3_start + _ans_lbl_w3 + 0.06
-        _bar_w3     = 7.45
+        _bar_w3     = 6.70          # reduced from 7.45 to compensate
         _cur_y3     = 1.24
 
         for _qi3, (_nq3_txt, _bars3_data, _tot3_n) in enumerate(_q_info):
@@ -4190,85 +4164,56 @@ def generate_pptx_bytes(tidy: pd.DataFrame, zm: dict, score_map: dict,
 
             # Answer bars
             for _bi3, (_an3_txt, _pct3, _cnt3) in enumerate(_bars3_data):
+                # Split multi-select answers on ";" so each option gets its own line
+                _ans_parts3 = [p.strip() for p in str(_an3_txt).split(";") if p.strip()]
+                _n_parts3   = max(1, len(_ans_parts3))
+                # Per-bar height scales with number of label lines; never shrinks below base
+                _this_bar_h = max(_base_bar_h, min(0.38, _n_parts3 * _line_h3))
+                # Safety: stop if next bar would exceed slide body
+                if _cur_y3 + _this_bar_h > 6.90:
+                    break
+
                 _clr3  = _SP_CLRS[_bi3 % len(_SP_CLRS)]
                 _tclr3 = _SP_TXT[_bi3 % len(_SP_TXT)]
-                _ans_s3 = (_an3_txt[:36] + "…") if len(_an3_txt) > 36 else _an3_txt
-                # Answer label (right-aligned)
-                add_text(slide, _ans_s3,
-                         _x3_start, _cur_y3, _ans_lbl_w3 - 0.08, _bar_h3,
-                         size=max(5.0, _bar_fs3 - 0.5), color=C_DARK_NAVY,
-                         align=PP_ALIGN.RIGHT, wrap=False)
+
+                # Answer label — multi-line, one paragraph per option, right-aligned
+                add_multiline_text(slide, _ans_parts3,
+                                   _x3_start, _cur_y3, _ans_lbl_w3 - 0.08, _this_bar_h,
+                                   size=_lbl_fs3, color=C_DARK_NAVY,
+                                   align=PP_ALIGN.RIGHT)
                 # Track
-                add_rect(slide, _bar_x3, _cur_y3 + _bar_h3 * 0.10,
-                         _bar_w3, _bar_h3 * 0.80, fill=_SOFT[0])
+                add_rect(slide, _bar_x3, _cur_y3 + _this_bar_h * 0.10,
+                         _bar_w3, _this_bar_h * 0.80, fill=_SOFT[0])
                 # Fill
                 _fw3 = max(0.05, _pct3 / 100 * _bar_w3)
-                add_rect(slide, _bar_x3, _cur_y3 + _bar_h3 * 0.10,
-                         _fw3, _bar_h3 * 0.80, fill=_clr3)
-                # % label inside bar
-                if _pct3 >= 8:
-                    add_text(slide, f"{_pct3:.0f}%",
-                             _bar_x3 + 0.04, _cur_y3 + _bar_h3 * 0.12,
-                             _fw3 - 0.05, _bar_h3 * 0.76,
-                             size=_bar_fs3, bold=True, color=_tclr3,
-                             align=PP_ALIGN.LEFT, wrap=False)
+                add_rect(slide, _bar_x3, _cur_y3 + _this_bar_h * 0.10,
+                         _fw3, _this_bar_h * 0.80, fill=_clr3)
+                # % label: dynamic — inside when bar is wide enough, outside when narrow
+                if _pct3 > 0:
+                    _lbl_txt3 = f"{_pct3:.0f}%"
+                    if _fw3 >= 0.20:
+                        # Inside bar — room for label
+                        add_text(slide, _lbl_txt3,
+                                 _bar_x3 + 0.04, _cur_y3 + _this_bar_h * 0.12,
+                                 max(0.10, _fw3 - 0.06), _this_bar_h * 0.76,
+                                 size=_bar_fs3, bold=True, color=_tclr3,
+                                 align=PP_ALIGN.LEFT, wrap=False)
+                    else:
+                        # Outside bar — to the right of the fill, on the grey track
+                        add_text(slide, _lbl_txt3,
+                                 _bar_x3 + _fw3 + 0.03, _cur_y3 + _this_bar_h * 0.12,
+                                 0.35, _this_bar_h * 0.76,
+                                 size=_bar_fs3, bold=True, color=C_DARK_NAVY,
+                                 align=PP_ALIGN.LEFT, wrap=False)
                 # n= label on first bar only
                 if _bi3 == 0:
                     add_text(slide, f"n={_tot3_n}",
-                             _bar_x3 + _bar_w3 + 0.08, _cur_y3 + _bar_h3 * 0.12,
-                             0.70, _bar_h3 * 0.76,
+                             _bar_x3 + _bar_w3 + 0.08, _cur_y3 + _this_bar_h * 0.12,
+                             0.70, _this_bar_h * 0.76,
                              size=6.5, color=C_DARK_NAVY, wrap=False)
-                _cur_y3 += _bar_h3
+                _cur_y3 += _this_bar_h
 
             _cur_y3 += _qgap3
-
-        # ════════════════════════════════════════════════════════════
-        # START POLL — SLIDE 4: RESPONDENTS PER QUESTION
-        # ════════════════════════════════════════════════════════════
-        slide = prs.slides.add_slide(blank)
-
-        add_rect(slide, 0, 0, 13.33, 1.05, fill=C_DARK_NAVY)
-        add_rect(slide, 0, 1.05, 13.33, 0.06, fill=C_BLUE)
-        add_header_logo(slide, _sap_logo_data)
-        add_heading(slide, "Respondents per Question",
-                    0.35, 0.10, 10.6, 0.58, size=22, color=C_WHITE)
-        add_text(slide, f"{_egi_display}  ·  Total responses per question (relative scale)",
-                 0.35, 0.68, 10.6, 0.30, size=8.5, color=C_LIGHT_BLUE)
-        add_footer(slide, 4)
-
-        # Reuse _q_info computed for slide 3
-        _rq_data  = [(q4, tot4) for q4, _, tot4 in _q_info]
-        _max_n4   = max(tot4 for _, tot4 in _rq_data) if _rq_data else 1
-
-        # (v90 — slot-based sizing: bars fill ~75% of available height)
-        _nq4      = len(_rq_data)
-        _avail4   = 5.28          # y=1.42 to y=6.70
-        _slot4    = _avail4 / max(_nq4, 1)
-        _rbh4     = min(0.72, max(0.26, _slot4 * 0.72))
-        _rgap4    = max(0.12, _slot4 * 0.28)
-        _lbl_w4   = 5.10
-        _bar_area4 = 6.60
-        _bar_x4   = 0.45 + _lbl_w4 + 0.12
-        _cur_y4   = 1.42
-
-        for _ql4, _nn4 in _rq_data:
-            _fw4 = max(0.10, _nn4 / _max_n4 * _bar_area4)
-            _qs4 = (_ql4[:66] + "…") if len(_ql4) > 66 else _ql4
-            # Label
-            add_text(slide, _qs4, 0.45, _cur_y4, _lbl_w4 - 0.08, _rbh4,
-                     size=7.5, color=C_DARK_NAVY, align=PP_ALIGN.RIGHT, wrap=True)
-            # Track
-            add_rect(slide, _bar_x4, _cur_y4 + _rbh4 * 0.15,
-                     _bar_area4, _rbh4 * 0.70, fill=_SOFT[0])
-            # Fill
-            add_rect(slide, _bar_x4, _cur_y4 + _rbh4 * 0.15,
-                     _fw4, _rbh4 * 0.70, fill=C_BLUE)
-            # n= label
-            add_text(slide, f"n = {_nn4}",
-                     _bar_x4 + _fw4 + 0.10, _cur_y4 + _rbh4 * 0.18,
-                     1.40, _rbh4 * 0.64,
-                     size=7.5, bold=True, color=C_DARK_NAVY, wrap=False)
-            _cur_y4 += _rbh4 + _rgap4
 
     # ── Serialise ─────────────────────────────────────────────
     buf = _io.BytesIO()
@@ -4399,12 +4344,12 @@ def build_score_bar_chart(per_question, scale):
     ))
     fig.update_layout(
         title=dict(text="Normalized Score per Question (0–100%)", font=dict(color=SAP_DARK_NAVY, size=14)),
-        xaxis=dict(domain=[0.40, 0.90], range=[0, 100], ticksuffix="%", gridcolor=SAP_GRAY_LIGHT),
+        xaxis=dict(range=[0, 100], ticksuffix="%", gridcolor=SAP_GRAY_LIGHT),
         yaxis=dict(autorange="reversed", tickfont=dict(size=12)),
         plot_bgcolor=SAP_WHITE, paper_bgcolor=SAP_WHITE,
         font=dict(family="Arial, sans-serif", color=SAP_BLACK),
-        margin=dict(l=10, r=10, t=40, b=20),
-        height=_chart_height(wrapped_q),
+        margin=dict(l=_chart_left_margin(wrapped_q), r=30, t=40, b=20),
+        height=_chart_height(wrapped_q, min_row_px=60, extra_px=80),
     )
     return fig
 
@@ -4419,37 +4364,43 @@ def build_favorable_chart(per_question):
     fig.add_trace(go.Bar(
         name="Positive",  y=wrapped_q, x=fav_vals,   orientation="h",
         marker_color=SAP_BLUE,
-        text=[f"{v}%" if v >= 8 else "" for v in fav_vals],
+        text=[f"{v}%" if v > 0 else "" for v in fav_vals],
         textposition="inside", insidetextanchor="middle",
+        constraintext="none",
+        textfont=dict(color=SAP_WHITE, size=10),
         hovertemplate="<b>%{customdata}</b><br>Positive: %{x}%<extra></extra>",
         customdata=q_keys,
     ))
     fig.add_trace(go.Bar(
         name="Neutral",   y=wrapped_q, x=neut_vals,  orientation="h",
         marker_color=SAP_LIGHT_BLUE,
-        text=[f"{v}%" if v >= 8 else "" for v in neut_vals],
+        text=[f"{v}%" if v > 0 else "" for v in neut_vals],
         textposition="inside", insidetextanchor="middle",
+        constraintext="none",
+        textfont=dict(color=SAP_DEEP_NAVY, size=10),
         hovertemplate="<b>%{customdata}</b><br>Neutral: %{x}%<extra></extra>",
         customdata=q_keys,
     ))
     fig.add_trace(go.Bar(
         name="Negative",  y=wrapped_q, x=unfav_vals, orientation="h",
         marker_color=SAP_DEEP_NAVY,
-        text=[f"{v}%" if v >= 8 else "" for v in unfav_vals],
+        text=[f"{v}%" if v > 0 else "" for v in unfav_vals],
         textposition="inside", insidetextanchor="middle",
+        constraintext="none",
+        textfont=dict(color=SAP_WHITE, size=10),
         hovertemplate="<b>%{customdata}</b><br>Negative: %{x}%<extra></extra>",
         customdata=q_keys,
     ))
     fig.update_layout(
         barmode="stack",
         title=dict(text="Favorability by Question", font=dict(color=SAP_DARK_NAVY, size=14)),
-        xaxis=dict(domain=[0.40, 0.93], ticksuffix="%", range=[0, 100], gridcolor=SAP_GRAY_LIGHT),
+        xaxis=dict(range=[0, 100], ticksuffix="%", gridcolor=SAP_GRAY_LIGHT),
         yaxis=dict(autorange="reversed", tickfont=dict(size=12)),
         plot_bgcolor=SAP_WHITE, paper_bgcolor=SAP_WHITE,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
         font=dict(family="Arial, sans-serif"),
-        margin=dict(l=10, r=10, t=60, b=20),
-        height=_chart_height(wrapped_q, extra_px=110),
+        margin=dict(l=_chart_left_margin(wrapped_q), r=30, t=70, b=20),
+        height=_chart_height(wrapped_q, min_row_px=60, extra_px=95),
     )
     return fig
 
@@ -4839,7 +4790,7 @@ if selected_view == "Consolidated View":
         poll
         for data in display_map.values()
         for poll in data["tidy"]["Poll"].unique()
-        if _is_valid_poll(poll)
+        if _is_valid_poll(poll) and _is_accepted_poll(poll)
     ))
 
     # ─────────────────────────────────────────────────────────────
@@ -4881,12 +4832,16 @@ if selected_view == "Consolidated View":
     # ──────────────────────────────────────────────────────────────
     # COMBINED EGI SUMMARY TABLE  (v95 — expandable, rowspan on EGI)
     # ──────────────────────────────────────────────────────────────
-    st.markdown('<div class="section-title">EGI Summary</div>', unsafe_allow_html=True)
 
     _summary_rows = []
+    _cons_excl_polls = set()
     for _egi_name in sorted(display_map.keys()):
         _egi_tidy = display_map[_egi_name]["tidy"]
         for _pt in sorted(_egi_tidy["Poll"].unique()):
+            if not _is_accepted_poll(_pt):
+                if _is_valid_poll(_pt):
+                    _cons_excl_polls.add(_pt)
+                continue
             _pt_sub = _egi_tidy[_egi_tidy["Poll"] == _pt]
             if _pt_sub.empty:
                 continue
@@ -4951,8 +4906,18 @@ if selected_view == "Consolidated View":
             f'</tr></thead><tbody>{_html_rows}</tbody></table>'
         )
 
-        with st.expander("EGI Summary", expanded=True):
+        with st.expander("EGI Summary by Poll Type", expanded=True):
             st.markdown(_tbl_html, unsafe_allow_html=True)
+            if _cons_excl_polls:
+                _excl_list = ", ".join(sorted(_cons_excl_polls))
+                st.markdown(
+                    f'<div style="margin-top:12px;padding:8px 12px;background:#FFF8E1;'
+                    f'border-left:3px solid #F39C12;border-radius:4px;'
+                    f'font-size:0.78rem;color:#7D5C00;">'
+                    f'<strong>Poll types excluded from analysis:</strong> {_excl_list}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
     # No shared filter state needed — individual EGI view manages its own filter
     st.session_state["shared_poll_filter"] = []
@@ -5258,6 +5223,133 @@ if selected_view == "Consolidated View":
                     unsafe_allow_html=True,
                 )
 
+        # ── Participant Comments — consolidated Q06 ───────────────────────
+        _cp_freetext_qs = [
+            q for q, grp in _cp_tidy.groupby("Question", sort=False)
+            if _is_freetext_question(grp)
+        ]
+        if _cp_freetext_qs:
+            import html as _html_mod
+            st.markdown(
+                '<div class="section-title">Participant Comments</div>',
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                f"Open-text responses aggregated across {_n_egis_cp} EGI(s) with closing poll data. "
+                "Instructor names have been replaced with [Name]."
+            )
+            for _cp_ft_q in _cp_freetext_qs:
+                _cp_ft_resp = (
+                    _cp_tidy[_cp_tidy["Question"] == _cp_ft_q][["Answer", "Count"]]
+                    .assign(_len=lambda d: d["Answer"].str.len())
+                    .sort_values(["Count", "_len"], ascending=[False, False])
+                    .drop(columns="_len")
+                )
+                _cp_ft_resp = _cp_ft_resp[
+                    _cp_ft_resp["Answer"].str.strip().str.len() > 4
+                ]
+                _cp_n_resp   = int(_cp_ft_resp["Count"].sum())
+                _cp_n_unique = len(_cp_ft_resp)
+                with st.expander(
+                    f"{_cp_ft_q}  ·  {_cp_n_resp} response(s)  ·  "
+                    f"{_cp_n_unique} unique  ·  {_n_egis_cp} EGI(s)",
+                    expanded=True,
+                ):
+                    if _cp_ft_resp.empty:
+                        st.caption("No comments recorded for this question.")
+                    else:
+                        for _, _cp_row in _cp_ft_resp.iterrows():
+                            _cp_ans   = _html_mod.escape(str(_cp_row["Answer"]).strip())
+                            _cp_cnt   = int(_cp_row["Count"])
+                            _cp_badge = (
+                                f'<span style="background:{SAP_BLUE};color:#fff;'
+                                f'border-radius:10px;padding:1px 8px;'
+                                f'font-size:0.72rem;margin-left:8px;vertical-align:middle;">'
+                                f'&times;{_cp_cnt}</span>'
+                                if _cp_cnt > 1 else ""
+                            )
+                            st.markdown(
+                                f'<div style="background:#FFFFFF;border:1px solid #DDE3EE;'
+                                f'border-left:4px solid {SAP_BLUE};'
+                                f'border-radius:6px;padding:13px 16px;margin-bottom:9px;">'
+                                f'<span style="color:{SAP_DARK_NAVY};font-size:0.9rem;'
+                                f'line-height:1.6;">{_cp_ans}{_cp_badge}</span>'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+
+        # ── Insights & Recommendations — consolidated closing poll ────────
+        st.markdown(
+            '<div class="section-title">Insights &amp; Recommendations</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            f"Automatically generated from aggregated closing poll scores across "
+            f"{_n_egis_cp} EGI(s). "
+            "Value & Impact highlights what is working well. "
+            "Recommendations indicate areas for improvement and strategic opportunities."
+        )
+        _cp_insights = generate_zoom_insights(_cp_zm, _cp_tidy, _cp_sm)
+        _cp_grp      = group_insights(_cp_insights)
+
+        _cp_ins_order = ["Recommendations", "Value & Impact"]
+        _cp_ins_hdr_cfg = {
+            "Recommendations": {
+                "bg":   "#C0D8EE",
+                "fc":   "#002A86",
+                "desc": "Areas where targeted action, content review, or strategic investment is recommended.",
+            },
+            "Value & Impact": {
+                "bg":   "#CCE8FA",
+                "fc":   "#004899",
+                "desc": "Positive signals reflecting value delivery, learner satisfaction, and EGI impact.",
+            },
+        }
+        _cp_tbl_rows    = ""
+        _cp_tbl_row_idx = 0
+        for _cp_ins_cat in _cp_ins_order:
+            _cp_ins_items = _cp_grp[_cp_ins_cat]
+            if not _cp_ins_items:
+                continue
+            _cp_hdr  = _cp_ins_hdr_cfg[_cp_ins_cat]
+            _cp_cnt  = len(_cp_ins_items)
+            _cp_tbl_rows += (
+                f'<tr style="background:{_cp_hdr["bg"]};">'
+                f'<td colspan="2" style="padding:7px 14px;font-size:0.72rem;font-weight:700;'
+                f'color:{_cp_hdr["fc"]};letter-spacing:0.05em;">'
+                f'{_cp_ins_cat.upper()} · {_cp_cnt} item{"s" if _cp_cnt != 1 else ""}'
+                f'<span style="font-weight:400;margin-left:10px;font-size:0.70rem;opacity:0.85;">'
+                f'{_cp_hdr["desc"]}</span></td></tr>'
+            )
+            for _cp_ins in _cp_ins_items:
+                _cp_tbl_row_idx += 1
+                _cp_row_bg   = SAP_WHITE if _cp_tbl_row_idx % 2 == 1 else "#F7F9FB"
+                _cp_i_text   = _strip_html(_cp_ins.get("text", ""))
+                _cp_i_action = _strip_html(_cp_ins.get("action", ""))
+                _cp_i_type   = _cp_ins.get("type", "neutral")
+                _cp_border   = SAP_DARK_NAVY if _cp_i_type == "warning" else SAP_BLUE
+                _cp_tbl_rows += (
+                    f'<tr style="border-bottom:1px solid {SAP_GRAY_LIGHT};background:{_cp_row_bg};">'
+                    f'<td style="border-left:3px solid {_cp_border};padding:11px 14px;vertical-align:top;">'
+                    f'<div style="color:{SAP_GRAY_DARK};font-size:0.84rem;line-height:1.55;">{_cp_i_text}</div></td>'
+                    f'<td style="padding:11px 14px;vertical-align:top;color:{SAP_BLACK};'
+                    f'font-size:0.80rem;line-height:1.55;">{_cp_i_action}</td></tr>'
+                )
+        if _cp_tbl_rows:
+            st.markdown(
+                f'<div style="border:1px solid {SAP_GRAY_LIGHT};border-radius:6px;overflow:hidden;margin-top:4px;">'
+                f'<table style="width:100%;border-collapse:collapse;font-family:Arial,sans-serif;">'
+                f'<thead><tr style="background:#89D1FF;color:{SAP_DARK_NAVY};">'
+                f'<th style="padding:8px 14px;text-align:left;width:50%;font-weight:700;'
+                f'font-size:0.76rem;letter-spacing:0.04em;">Insight</th>'
+                f'<th style="padding:8px 14px;text-align:left;font-weight:700;'
+                f'font-size:0.76rem;letter-spacing:0.04em;">Recommended Action</th></tr></thead>'
+                f'<tbody>{_cp_tbl_rows}</tbody></table></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.info("No insights could be generated for the consolidated closing poll data.")
+
     # ── Period Comparison — auto-shown when ≥2 periods are selected ──────
     if len(_pf_selected_labels) >= 2:
         st.markdown(
@@ -5267,7 +5359,7 @@ if selected_view == "Consolidated View":
 
         # Aggregate closing poll rows from the already-filtered display_map
         _pcv_cp_frames = [
-            d["tidy"][d["tidy"]["Poll"].apply(_is_closing_poll)]
+            d["tidy"][d["tidy"]["Poll"].str.contains("EGI_CLOSING_EN_V1", na=False)]
             for d in display_map.values()
         ]
         _pcv_cp_tidy = (
@@ -5279,7 +5371,7 @@ if selected_view == "Consolidated View":
         if _pcv_cp_tidy.empty:
             st.info(
                 "No closing poll data found for the selected periods. "
-                "Ensure uploaded files contain EGI_CLOSING_EN_V1 poll data (note: EGI_COSING_EN_V1 typo is also accepted)."
+                "Ensure uploaded files contain EGI_CLOSING_EN_V1 poll data."
             )
         else:
             # ── Per-period compute helper ─────────────────────────────
@@ -5356,7 +5448,7 @@ if selected_view == "Consolidated View":
                 for _pcv_lbl in _pcv_valid:
                     _pcv_table += f"<th style='{_pcv_th_c}'>{_pcv_lbl}</th>"
                 if _pcv_two:
-                    _pcv_table += f"<th style='{_pcv_th_c}'>Change</th>"
+                    _pcv_table += f"<th style='{_pcv_th_c}'>Trend</th>"
                 _pcv_table += "</tr></thead><tbody>"
 
                 # ── Data rows ─────────────────────────────────────────
@@ -5389,7 +5481,7 @@ if selected_view == "Consolidated View":
                                 _sign = "+" if _d > 0 else ""
                                 _suf  = "%" if _pcv_is_pct else ""
                                 _arr  = "↑" if _d > 0 else "↓"
-                                _dc   = SAP_BLUE if _d > 0 else "#C0392B"
+                                _dc   = "#27AE60" if _d > 0 else "#C0392B"
                                 _ds   = f"{_sign}{_d}{_suf} {_arr}"
                         else:
                             _ds, _dc = "—", SAP_GRAY_MED
@@ -5418,17 +5510,38 @@ if selected_view == "Consolidated View":
                 st.markdown(
                     f"<p style='font-size:0.72rem;color:{SAP_GRAY_MED};margin-top:8px;'>"
                     f"{_pcv_note}"
-                    f"Blue ↑ = improvement · Red ↓ = decline · "
+                    f"Green ↑ = improvement · Red ↓ = decline · "
                     f"Metrics aggregated across all EGIs with closing poll data."
                     f"</p>",
                     unsafe_allow_html=True,
                 )
+
+    # ── Consolidated Export ────────────────────────────────────
+    if _all_cp_frames:
+        st.markdown('<div class="section-title">Export Report</div>', unsafe_allow_html=True)
+        st.caption(
+            "Download a SAP-branded PowerPoint deck built from the consolidated "
+            "closing poll data across all uploaded EGIs."
+        )
+        with st.spinner("Building consolidated presentation…"):
+            _cp_pptx_bytes = generate_pptx_bytes(
+                _cp_tidy, _cp_zm, _cp_sm,
+                egi_name="Consolidated — All EGIs",
+            )
+        st.download_button(
+            label="Download Consolidated Closing Poll Report (.pptx)",
+            data=_cp_pptx_bytes,
+            file_name="egi_poll_consolidated.pptx",
+            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            help="3-slide SAP-branded deck: cover, executive summary, favorability by question — aggregated across all EGIs.",
+        )
 
     st.markdown(
         f"<br><small style='color:{SAP_GRAY_MED};'>EKX DeepAgent · EGI Poll Analytics · "
         f"Powered by SAP Knowledge Graph</small>",
         unsafe_allow_html=True,
     )
+
     st.stop()
 
 
@@ -5442,6 +5555,13 @@ current_egi    = selected_view        # human-readable EGI name for this view
 
 all_polls   = sorted(tidy_all["Poll"].unique().tolist())
 all_classes = sorted(tidy_all["Class"].unique().tolist())
+
+# ── Filter to accepted poll types only ────────────────────────
+_egi_all_raw_polls = [p for p in all_polls if _is_valid_poll(p)]
+_egi_excl_polls    = sorted(p for p in _egi_all_raw_polls if not _is_accepted_poll(p))
+tidy_all           = tidy_all[tidy_all["Poll"].apply(_is_accepted_poll)].reset_index(drop=True)
+all_polls          = sorted(tidy_all["Poll"].unique().tolist())
+all_classes        = sorted(tidy_all["Class"].unique().tolist())
 
 # ── Poll Type Breakdown table (mirrors Consolidated View) ─────
 st.markdown('<div class="section-title">Poll Type Breakdown</div>', unsafe_allow_html=True)
@@ -5463,37 +5583,48 @@ for _pt in all_polls:
     })
 if _egi_pt_rows:
     st.dataframe(pd.DataFrame(_egi_pt_rows), use_container_width=True, hide_index=True)
+if _egi_excl_polls:
+    _excl_str = ", ".join(_egi_excl_polls)
+    st.markdown(
+        f'<div style="margin-top:8px;padding:8px 12px;background:#FFF8E1;'
+        f'border-left:3px solid #F39C12;border-radius:4px;'
+        f'font-size:0.78rem;color:#7D5C00;">'
+        f'<strong>Poll types excluded from analysis:</strong> {_excl_str}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ── Poll Type filter ──────────────────────────────────────────
-st.markdown('<div class="filter-bar">', unsafe_allow_html=True)
-st.markdown('<div class="filter-label">Filter by Poll Type</div>', unsafe_allow_html=True)
+if len(all_polls) == 1:
+    # Single poll type — auto-select, no filter UI needed
+    active_polls = all_polls
+    tidy = tidy_all.copy()
+else:
+    st.markdown('<div class="filter-bar">', unsafe_allow_html=True)
+    st.markdown('<div class="filter-label">Filter by Poll Type</div>', unsafe_allow_html=True)
 
-_shared_default = [p for p in st.session_state.get("shared_poll_filter", []) if p in all_polls]
-selected_polls = st.multiselect(
-    "Poll Type",
-    options=all_polls,
-    default=_shared_default,
-    placeholder="All poll types shown — select to narrow down",
-    help="Leave empty to include all poll types. Select one or more to restrict the analysis.",
-    key="indiv_poll_type_filter",
-)
+    selected_polls = st.multiselect(
+        "Poll Type",
+        options=all_polls,
+        default=[],
+        placeholder="Select a poll type to view the analysis",
+        help="Select one or more poll types to view the detailed analysis.",
+        key="indiv_poll_type_filter",
+    )
 
-st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-# ── Apply filters ─────────────────────────────────────────────
-if not selected_polls:
-    if len(all_polls) == 1:
-        selected_polls = list(all_polls)   # auto-select when only one poll type is available
-    else:
+    # ── Require explicit selection before rendering analysis ───
+    if not selected_polls:
         st.info("Select a poll type above to view the detailed analysis.")
         st.stop()
 
-active_polls = selected_polls
-tidy = tidy_all[
-    tidy_all["Poll"].isin(active_polls)
-].reset_index(drop=True)
+    active_polls = selected_polls
+    tidy = tidy_all[
+        tidy_all["Poll"].isin(active_polls)
+    ].reset_index(drop=True)
 
 if tidy.empty:
     st.warning("No data matches the selected filters. Please adjust the filter bar above.")
@@ -5758,8 +5889,12 @@ if is_closing_view:
         )
         st.markdown(_rd_html, unsafe_allow_html=True)
 
-# ── Score Analysis ─────────────────────────────────────────────
-st.markdown('<div class="section-title">Score Analysis</div>', unsafe_allow_html=True)
+# ── Score Analysis / Response Analysis ─────────────────────────
+st.markdown(
+    '<div class="section-title">Score Analysis</div>' if is_closing_view
+    else '<div class="section-title">Response Analysis</div>',
+    unsafe_allow_html=True,
+)
 
 if is_closing_view:
     tab1, tab2, tab3 = st.tabs(["Overall Scores", "Favorability by Question", "How it Works"])
